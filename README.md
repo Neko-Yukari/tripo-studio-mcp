@@ -1,50 +1,54 @@
 # tripo-studio-mcp
 
-用 **Tripo Studio 订阅额度**生成 3D 模型的 MCP server。文字或参考图进去，GLB 出来，agent 直接调用。
+**English** · [简体中文](README.zh-CN.md)
 
-> ⚠️ **非官方项目**。这里用的是 Tripo Studio 网页版背后的内部接口，不是 Tripo 官方 OpenAPI。接口随时可能变，账号风险自负，详见[免责声明](#免责声明)。
+An MCP server that turns text or a reference image into a 3D model by spending your **Tripo Studio subscription credits**, then hands the agent a local GLB file.
 
-## 为什么会有这个
+> ⚠️ **Unofficial.** This drives the internal endpoints behind the Tripo Studio web app, not Tripo's official OpenAPI. Endpoints can change without notice, and your account is your own responsibility. See [Disclaimer](#disclaimer).
 
-Tripo 官方 API 按量付费（$1 = 100 积分，一次生成约 40–50 积分，约 $0.4–0.5），积分永久有效。Studio 订阅是包月制（Pro 约 ¥140/月含 3000 积分，折合每次约 25 积分），但官方文档明确写了：**订阅额度不能用来调 API**。
+## Why this exists
 
-于是这个项目换了个思路：不调 API，而是用你在浏览器里登录 Studio 后拿到的会话 Cookie，直接驱动 Studio 自己用的那套接口。订阅照常计费，但 agent 能用了。
+Tripo's official API is pay-as-you-go: $1 buys 100 credits, one generation costs about 40–50 credits, so roughly $0.40–0.50 per model. Credits never expire.
 
-适合：已经有 Studio 订阅、想让 agent 批量出素材的建模工作流。
-不适合：需要 webhook、批量任务队列、正式 SLA 的生产环境 —— 那些应该走官方 API。
+A Studio subscription works the other way. Pro is about ¥140/month for 3000 credits, which puts one generation near 25 credits. The catch is documented: **subscription credits cannot be used to call the API.**
 
-## 能力
+So this project skips the API. It takes the session cookie your browser gets after you log in to Studio, and calls the same endpoints Studio's own frontend calls. Billing still runs through your subscription, but now an agent can drive it.
 
-| 工具 | 作用 |
+Use it if you already pay for Studio and want an agent to produce assets in bulk. Do not use it for anything that needs webhooks, job queues, or a support contract — those belong to the official API.
+
+## Tools
+
+| Tool | What it does |
 |---|---|
-| `tripo_status` | 查看套餐、到期时间、自动续费；也可查某个操作的进度 |
-| `tripo_generate_text` | 文字 → 3D 模型，阻塞等待并下载 GLB |
-| `tripo_generate_image` | 参考图 → 3D 模型（本地图片自动上传送审），阻塞等待并下载 GLB |
-| `tripo_download` | 按 `project_id` 重新下载模型 |
+| `tripo_status` | Shows plan, expiry and auto-renew; can also poll one operation's progress |
+| `tripo_generate_text` | Text prompt → 3D model; waits for completion and downloads the GLB |
+| `tripo_generate_image` | Reference image → 3D model; uploads the image and passes its moderation check first |
+| `tripo_download` | Downloads a model again by `project_id` |
 
-参数名与 [官方文档](https://platform.tripo3d.ai/docs/generation) 保持一致，熟悉官方 API 的话可以直接照搬：
+Parameter names follow the [official docs](https://platform.tripo3d.ai/docs/generation), so anything you already know from the official API carries over:
 
-`model_version`、`face_limit`、`texture`、`pbr`、`texture_quality`(standard/detailed/extreme)、`geometry_quality`(standard/detailed)、`texture_alignment`(original_image/geometry)、`quad`、`auto_size`、`orientation`(default/align_image)、`compress`(geometry/meshopt)、`smart_low_poly`、`generate_parts`、`export_uv`、`model_seed`、`texture_seed`、`visibility`(private/public/shareable)。
+`model_version`, `face_limit`, `texture`, `pbr`, `texture_quality` (standard/detailed/extreme), `geometry_quality` (standard/detailed), `texture_alignment` (original_image/geometry), `quad`, `auto_size`, `orientation` (default/align_image), `compress` (geometry/meshopt), `smart_low_poly`, `generate_parts`, `export_uv`, `model_seed`, `texture_seed`, `visibility` (private/public/shareable).
 
-默认 `model_version` 为 `v3.1-20260211`（H3.1 最高质量），一次约 55 积分。`quad=true` 输出四边面、面数上限 150,000。`generate_parts` 与 `texture`/`pbr`/`quad` 不兼容。
+A few defaults are worth knowing. `model_version` defaults to `v3.1-20260211` (H3.1 highest quality) and costs about 55 credits per run. Setting `quad=true` forces quad topology, and then `face_limit` cannot exceed 150,000. Setting `generate_parts=true` conflicts with `texture`, `pbr` and `quad`.
 
-## 安装
+## Install
 
-需要 Node ≥ 18。
+You need Node 18 or newer.
 
 ```bash
-git clone <this repo> && cd tripo-studio-mcp
-npm i                       # 只为登录脚本装 playwright
-npm run login               # 弹出真实 Chrome，登录 Studio 后自动保存登录态
+git clone https://github.com/Neko-Yukari/tripo-studio-mcp.git
+cd tripo-studio-mcp
+npm i          # installs playwright for the login script only
+npm run login  # opens real Chrome, and saves the session once you log in
 ```
 
-登录态会写到 `~/.tripo/studio-state.json`，有效期通常约一个月，过期重新 `npm run login` 即可。
+The login script writes `~/.tripo/studio-state.json`. That session usually lasts about a month; run `npm run login` again when it expires.
 
-登录这一步必须用**有头浏览器**：Studio 前面有 Cloudflare，纯 HTTP 拿不到有效会话。脚本默认调用系统已装的 Chrome。
+Login has to happen in a headed browser. Studio sits behind Cloudflare, so plain HTTP requests cannot obtain a valid session on their own. The script reuses the Chrome you already have installed.
 
-### 接进 MCP 客户端
+### Register with an MCP client
 
-Claude Desktop / 通用 JSON：
+Generic JSON, works for Claude Desktop and similar:
 
 ```json
 {
@@ -57,75 +61,75 @@ Claude Desktop / 通用 JSON：
 }
 ```
 
-opencode + magpie（本项目实测环境）：
+For opencode with magpie, which is what this project was built and tested on:
 
 ```bash
 magpie library mcp add tripo-studio node /absolute/path/to/server.mjs agents=opencode --local
 ```
 
-`--local` 表示只写本机配置，不跟着配置同步跑到别的机器上。
+`--local` keeps the entry on this machine, so it will not follow your config sync to another computer.
 
-## 配置
+## Configuration
 
-全走环境变量，都有默认值：
+Everything is an environment variable, and all of them have defaults.
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Purpose |
 |---|---|---|
-| `TRIPO_STUDIO_STATE` | `~/.tripo/studio-state.json` | 登录态文件路径 |
-| `TRIPO_STUDIO_CONFIG` | `~/.tripo/config.json` | 可选配置文件，支持 `{"proxy": "...", "model_version": "..."}` |
-| `TRIPO_PROXY` | 空 | HTTP 代理，如 `http://127.0.0.1:7890` |
-| `HTTPS_PROXY` | 空 | 同上，优先级低于 `TRIPO_PROXY` |
-| `TRIPO_NO_PROXY` | 空 | 设为任意值则强制直连 |
-| `TRIPO_USER_AGENT` | Chrome 156 UA | 一般不用改 |
+| `TRIPO_STUDIO_STATE` | `~/.tripo/studio-state.json` | Path to the saved session |
+| `TRIPO_STUDIO_CONFIG` | `~/.tripo/config.json` | Optional file, supports `{"proxy": "...", "model_version": "..."}` |
+| `TRIPO_PROXY` | empty | HTTP proxy such as `http://127.0.0.1:7890` |
+| `HTTPS_PROXY` | empty | Same as above, lower priority than `TRIPO_PROXY` |
+| `TRIPO_NO_PROXY` | empty | Set to anything to force a direct connection |
+| `TRIPO_USER_AGENT` | Chrome 156 UA | Rarely needs changing |
 
-## 成本
+## Cost
 
-按 Studio 订阅额度扣，一次文字/图片生成基准约 55 积分（H3.1 最高质量）。`texture_quality=extreme` 会额外加价。工具本身不扣积分、不消耗 API 额度。
+Every generation spends Studio subscription credits: about 55 for a default text or image run. Choosing `texture_quality=extreme` adds more. The MCP calls themselves are free, and no API credits are touched.
 
-## 已知限制
+## Known limits
 
-- **只有 GLB**。Studio 的 FBX/OBJ/STL 导出走的是另一条链路（`operation/export` 能建任务，但成品下载地址还没摸通），对 Blender 来说 GLB 够用，所以先这样。
-- **没有 webhook**，靠轮询 `progress`。工具默认阻塞等 8 分钟，超时会返回 `operator_id`/`project_id`，之后用 `tripo_download` 取。
-- 只有**单图**入口（内部走 `batch_image_to_model` 的数组形式）；多视图 `multiview_to_model` 没接。
-- 依赖 Cookie，**约一个月过期**。
-- 内部接口没有版本保证，Tripo 改版可能直接失效。
+- **GLB only.** Studio's FBX/OBJ/STL export runs through a separate path. `operation/export` does accept a job, but the download URL for the result is still unresolved. Since Blender imports GLB natively, GLB covers the main use case.
+- **No webhooks.** The server polls `progress` instead. A tool waits up to 8 minutes by default; if it times out you get `operator_id` and `project_id`, and can fetch the model later with `tripo_download`.
+- **Single image only.** Internally this goes through the array form of `batch_image_to_model`. Multi-view `multiview_to_model` is not wired up.
+- **The cookie expires**, usually after about a month.
+- **No compatibility promise.** These are internal endpoints; a Tripo redesign can break them at any time.
 
-## 实现要点
+## How it works
 
-给后来维护的人，接口流程是实测出来的：
-
-```
-文字：POST /v2/studio/operation/text_to_model      → task_id + project_id
-图片：POST /v2/studio/operation/batch_image_to_model → [{project_id, operator_id}]
-轮询：POST /v2/studio/progress  {ids:[id]}          → status/progress/left_time
-取件：GET  /v2/studio/project/detail/v3/{project_id} → data.model_url（S3 签名 URL）
-```
-
-图片上传：
+Recorded here so the next maintainer does not have to reverse-engineer it again.
 
 ```
-POST /v2/studio/storage/temporary_token {client:"aws", format:"webp"}  → STS 临时凭据 + resource_bucket/resource_uri
-PUT  https://{bucket}.{host}/{resource_uri}?x-id=PutObject              → SigV4 签名，region us-east-1
+text:   POST /v2/studio/operation/text_to_model       → task_id + project_id
+image:  POST /v2/studio/operation/batch_image_to_model → [{project_id, operator_id}]
+poll:   POST /v2/studio/progress  {ids:[id]}           → status / progress / left_time
+fetch:  GET  /v2/studio/project/detail/v3/{project_id} → data.model_url (signed S3 URL)
+```
+
+Image upload takes three steps:
+
+```
+POST /v2/studio/storage/temporary_token {client:"aws", format:"webp"}  → STS credentials + resource_bucket / resource_uri
+PUT  https://{bucket}.{host}/{resource_uri}?x-id=PutObject              → SigV4, region us-east-1
 POST /v2/studio/audit/image {image:{bucket,key}}                        → {result:"pass"}
 ```
 
-踩过的坑，省得再踩一遍：
+Five things cost real time to find:
 
-1. S3 走的是 **s3-accelerate** 端点，签名区域必须 `us-east-1`，查询串 `x-id=PutObject` 要进 canonical request。
-2. 必须显式发 **`Content-Length`**。用 chunked 上传 S3 直接 `501 NotImplemented`，报错还写着 `Header Transfer-Encoding`。
-3. 图片生成的 `image` 是**数组**，每项必须带 `image_audit_result` 和 `image_source`，少一个就 `11002 Image audit result not found` —— 这个错误信息会把人骗去重试审核，其实是请求体字段不全。
-4. `image` 只接受 `{bucket, key}` 对象，传字符串或 URL 都是 `1004`。
-5. `progress` 偶发 502，轮询要能容忍连续失败。
+1. Uploads go to the **s3-accelerate** endpoint. The signature must use `us-east-1`, and the `x-id=PutObject` query string has to be part of the canonical request.
+2. You must send an explicit **`Content-Length`**. Chunked uploads get a bare `501 NotImplemented`, and the reported offending header is `Transfer-Encoding`, which sends you looking in the wrong place.
+3. The image payload is an **array**, and every item needs both `image_audit_result` and `image_source`. Miss either one and you get `11002 Image audit result not found` — a message that invites you to re-run moderation, when the real problem is an incomplete request body.
+4. `image` only accepts a `{bucket, key}` object. A string or a URL returns `1004`.
+5. `progress` occasionally answers 502, so polling has to survive several consecutive failures.
 
-## 安全
+## Security
 
-- `studio-state.json` 里的 Cookie 等同账号凭据，**不要提交、不要外发**。
-- 本项目不收集任何数据，所有请求直连 Tripo。
-- 生成的模型归属与留存遵循 Tripo 自己的条款。
+The cookie inside `studio-state.json` is equivalent to your account credentials. Never commit it and never share it.
 
-## 免责声明
+This project collects nothing and talks only to Tripo. Generated models are governed by Tripo's own terms.
 
-本项目未获得 Tripo 官方授权，使用的是网页版内部接口，可能违反其服务条款，也可能在任何时候失效或导致账号受限。仅供个人学习与研究使用，风险自负，作者不承担任何责任。商业或生产用途请使用 [Tripo 官方 API](https://platform.tripo3d.ai/)。
+## Disclaimer
+
+This project is not affiliated with or endorsed by Tripo. It uses internal endpoints of the web app, which may violate their terms of service, may stop working at any time, and may put your account at risk. It is meant for personal study and research; you use it at your own risk and the author accepts no liability. For commercial or production use, go with the [official Tripo API](https://platform.tripo3d.ai/).
 
 ## License
 

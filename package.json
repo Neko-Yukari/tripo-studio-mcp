@@ -5,7 +5,7 @@
   "type": "module",
   "bin": { "tripo-studio-mcp": "server.mjs" },
   "main": "server.mjs",
-  "files": ["server.mjs", "login.mjs", "README.md", "LICENSE"],
+  "files": ["server.mjs", "login.mjs", "README.md", "README.zh-CN.md", "LICENSE"],
   "scripts": {
     "start": "node server.mjs",
     "login": "node login.mjs",
