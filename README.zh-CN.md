@@ -24,6 +24,11 @@ Studio 订阅正好相反，按月收费。Pro 大约每月 ¥140 含 3000 积�
 | `tripo_generate_text` | 文字生成模型，等到生成完成后下载 GLB |
 | `tripo_generate_image` | 参考图生成模型，会先上传图片并送审，再下载 GLB |
 | `tripo_generate_multiview` | 用 2–4 张同一物体的不同视角生成（front / left / right / back） |
+| `tripo_remesh` | 重拓扑/减面到指定面数，可选四边面 |
+| `tripo_texture` | 重新生成贴图，可给参考图 |
+| `tripo_uv` | 智能 UV 展开 |
+| `tripo_rig` | 自动骨骼绑定（面向人形） |
+| `tripo_upscale` | 纹理放大 |
 | `tripo_download` | 按 `project_id` 重新下载模型，`format` 可选 glb、fbx、obj、stl |
 
 参数名跟[官方文档](https://platform.tripo3d.ai/docs/generation)保持一致，你在官方 API 上会的用法可以直接搬过来：

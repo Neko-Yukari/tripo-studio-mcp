@@ -24,6 +24,11 @@ Use it if you already pay for Studio and want an agent to produce assets in bulk
 | `tripo_generate_text` | Text prompt → 3D model; waits for completion and downloads the GLB |
 | `tripo_generate_image` | Reference image → 3D model; uploads the image and passes its moderation check first |
 | `tripo_generate_multiview` | 2–4 views of one object (front, left, right, back) → 3D model |
+| `tripo_remesh` | Retopology / decimation to a target face count (quad or triangle) |
+| `tripo_texture` | Regenerates textures, optionally from a reference image |
+| `tripo_uv` | Smart UV unwrap |
+| `tripo_rig` | Automatic rigging (built for humanoid shapes) |
+| `tripo_upscale` | Texture upscaling |
 | `tripo_download` | Downloads a model again by `project_id`; `format` picks glb, fbx, obj or stl |
 
 Parameter names follow the [official docs](https://platform.tripo3d.ai/docs/generation), so anything you already know from the official API carries over:

@@ -88,11 +88,23 @@ async function request(method, urlStr, { headers = {}, body = null, binary = fal
     req.end();
   });
 
+  const attemptWithRetry = async (withProxy, times = 3) => {
+    let lastErr;
+    for (let i = 0; i < times; i++) {
+      try { return await attempt(withProxy); } catch (e) {
+        lastErr = e;
+        if (!['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE'].includes(e.code)) throw e;
+        await new Promise((r) => setTimeout(r, 800 * (i + 1)));
+      }
+    }
+    throw lastErr;
+  };
+
   try {
-    return await attempt(defaultProxy);
+    return await attemptWithRetry(defaultProxy, 3);
   } catch (e) {
-    // 代理连通性坏掉时退回直连，避免整条上传链路被挡死
-    if (defaultProxy && ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'].includes(e.code)) return attempt(false);
+    // 代理连通性坏掉时退回直连，避免整条链路被挡死
+    if (defaultProxy) return attemptWithRetry(false, 2);
     throw e;
   }
 }
@@ -122,6 +134,9 @@ async function api(method, p, body) {
   const r = await request(method, BASE + p, { headers: apiHeaders(), body: body === undefined ? null : JSON.stringify(body) });
   let json = null;
   try { json = JSON.parse(r.text); } catch { /* 非 JSON */ }
+  if (process.env.TRIPO_DEBUG) {
+    console.error('[tripo]', method, p, '<-', body === undefined ? '' : JSON.stringify(body).slice(0, 400), '->', r.status, String(r.text).slice(0, 200));
+  }
   if (r.status >= 400 || (json && typeof json.code === 'number' && json.code !== 0)) {
     const msg = json ? `${json.code}: ${json.message || ''} ${json.suggestion || ''}` : r.text.slice(0, 200);
     throw new Error(`Tripo ${method} ${p} -> HTTP ${r.status} ${msg}`.trim());
@@ -194,8 +209,33 @@ function applyParams(body, args) {
   return body;
 }
 
-async function waitTask(id, timeoutMs) {
-  const t0 = Date.now();
+// 后处理类接口（remesh/texture/...）返回的字段名不统一，统一取一个可轮询的 id
+function progressId(data) {
+  const d = Array.isArray(data) ? data[0] : data;
+  if (!d || typeof d !== 'object') return null;
+  return d.operation_id || d.operator_id || d.task_id || d.project_id || d.id || null;
+}
+
+// 后处理接口的 part_name_list 用的是项目根节点名（tripo_node_<根 operator>），重拓扑后也不变
+async function meshPartNames(projectId) {
+  try {
+    const h = await api('GET', `/project/history/${projectId}?locale=zh-CN`);
+    const list = h?.data?.history || [];
+    // 根节点名取自最初那次生成；后续 remesh/texture 会开自己的目录，不能拿来拼
+    const root = list.find((it) => /^(text|image|multiview)_to_model$/.test(String(it.type || ''))) || list[list.length - 1];
+    if (root?.operator_id) return [`tripo_node_${root.operator_id}`];
+    const m = String(root?.rendered_image || '').match(/\/tripo-studio\/\d+\/([0-9a-f-]{36})\//i);
+    if (m) return [`tripo_node_${m[1]}`];
+  } catch { /* 落到下面的兜底 */ }
+  try {
+    const det = await api('GET', `/project/detail/v3/${projectId}?locale=zh-CN`);
+    const m = String(det?.data?.model_url || '').match(/\/tripo-studio\/\d+\/([0-9a-f-]{36})\//i);
+    if (m) return [`tripo_node_${m[1]}`];
+  } catch { /* 忽略 */ }
+  return null;
+}
+
+async function waitTask(id, timeoutMs) {  const t0 = Date.now();
   let last = null;
   let fails = 0;
   while (Date.now() - t0 < timeoutMs) {
@@ -418,6 +458,80 @@ const TOOLS = [
     },
   },
   {
+    name: 'tripo_remesh',
+    description: '重拓扑/减面：把已有项目重新布线到指定面数，对应内部接口 operation/remesh。会覆盖项目当前模型（生成新版本），完成后用 tripo_download 取。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        face_limit: { type: 'integer', description: '目标面数，界面范围 500–10000，默认 10000' },
+        quad: { type: 'boolean', description: '四边形拓扑，默认 true；false 为三角面' },
+        smart_poly: { type: 'boolean', description: '智能网格，默认 true' },
+        bake: { type: 'boolean', description: '烘焙原贴图到新网格，默认 true' },
+        part_name_list: { type: 'array', items: { type: 'string' }, description: '只处理指定部件；默认按当前模型的节点名自动填' },
+        wait_seconds: { type: 'integer', description: '阻塞等待上限，默认 480 秒' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
+    name: 'tripo_texture',
+    description: '重新生成贴图，对应内部接口 operation/texture_model。可以给一张参考图，也可以不给（纯靠几何推纹理）。会覆盖项目当前模型，完成后用 tripo_download 取。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        image_path: { type: 'string', description: '参考图（可选），不给就按几何生成' },
+        texture_quality: { type: 'string', enum: ['standard', 'detailed', 'extreme'], description: '默认 detailed' },
+        texture_alignment: { type: 'string', enum: ['original_image', 'geometry'], description: '默认 original_image' },
+        delight: { type: 'boolean', description: '去光处理，默认 false' },
+        part_names: { type: 'array', items: { type: 'string' }, description: '默认按项目根节点自动填' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
+    name: 'tripo_uv',
+    description: '智能 UV 展开，对应内部接口 operation/uv_edit/generate。会覆盖项目当前模型。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
+    name: 'tripo_rig',
+    description: '自动骨骼绑定，对应内部接口 operation/rigging_model。适合人形模型，椅子之类会失败。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        rig_type: { type: 'string', description: '骨骼类型，默认 biped' },
+        part_name_list: { type: 'array', items: { type: 'string' }, description: '默认按项目根节点自动填' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
+    name: 'tripo_upscale',
+    description: '纹理放大，对应内部接口 operation/texture_upscaler。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        model_version: { type: 'string', description: '放大模型版本，目前只接受 v1.0-20250506' },
+        part_name_list: { type: 'array', items: { type: 'string' }, description: '默认按项目根节点自动填' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
     name: 'tripo_download',
     description: '把一个已有项目（project_id）的模型下载到本地。format 可选 glb / fbx / obj / stl，后三种在本地用 assimp 转换；FBX 和 OBJ 会连同贴图解到同名目录。',
     inputSchema: {
@@ -524,6 +638,82 @@ async function callTool(name, args) {
     return { task_id, project_id, status: st.status, file: file.path, bytes: file.bytes };
   }
 
+  if (name === 'tripo_remesh') {
+    const parts = args.part_name_list || await meshPartNames(args.project_id);
+    const body = {
+      project_id: args.project_id,
+      face_limit: args.face_limit ?? 10000,
+      quad: args.quad ?? true,
+      smart_poly: args.smart_poly ?? true,
+      bake: args.bake ?? true,
+      model_version: 'default',
+    };
+    if (parts && parts.length) body.part_name_list = parts;
+    const j = await api('POST', '/operation/remesh', body);
+    const id = progressId(j.data);
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: '重拓扑仍在进行，稍后用 tripo_download' };
+    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
+  }
+
+  if (name === 'tripo_texture') {
+    const parts = args.part_names || await meshPartNames(args.project_id);
+    const body = {
+      project_id: args.project_id,
+      texture_quality: args.texture_quality || 'detailed',
+      texture_alignment: args.texture_alignment || 'original_image',
+      delight: args.delight ?? false,
+    };
+    if (parts && parts.length) body.part_names = parts;
+    if (args.image_path) {
+      if (!fs.existsSync(args.image_path)) throw new Error('找不到图片: ' + args.image_path);
+      const img = await uploadImage(args.image_path);
+      body.image = { bucket: img.bucket, key: img.key, image_audit_result: img.audit, image_source: 'upload' };
+    }
+    const j = await api('POST', '/operation/texture_model', body);
+    const id = progressId(j.data);
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: '贴图仍在生成，稍后用 tripo_download' };
+    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
+  }
+
+  if (name === 'tripo_uv') {
+    const det = await api('GET', `/project/detail/v3/${args.project_id}?locale=zh-CN`);
+    const cur = det?.data?.operator?.operator_id;
+    if (!cur) throw new Error('取不到项目当前 operator');
+    // 必须先取一次 context，action 要用上下文给出的 next_action（generate / retry）
+    const ctxRes = await api('POST', '/operation/uv_edit/context', { current_operator_id: cur, project_id: args.project_id });
+    const action = ctxRes?.data?.next_action || 'generate';
+    const target = ctxRes?.data?.current_operator_id || cur;
+    const j = await api('POST', '/operation/uv_edit/generate', { action, current_operator_id: target, project_id: args.project_id });
+    const id = progressId(j.data) || target;
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: 'UV 仍在展开，稍后用 tripo_download' };
+    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
+  }
+
+  if (name === 'tripo_rig') {
+    const parts = args.part_name_list || await meshPartNames(args.project_id);
+    const body = { project_id: args.project_id, rig_type: args.rig_type || 'biped' };
+    if (parts && parts.length) body.part_name_list = parts;
+    const j = await api('POST', '/operation/rigging_model', body);
+    const id = progressId(j.data);
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: '绑定仍在进行，稍后用 tripo_download' };
+    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
+  }
+
+  if (name === 'tripo_upscale') {
+    const parts = args.part_name_list || await meshPartNames(args.project_id);
+    const body = { project_id: args.project_id, model_version: args.model_version || 'v1.0-20250506' };
+    if (parts && parts.length) body.part_name_list = parts;
+    const j = await api('POST', '/operation/texture_upscaler', body);
+    const id = progressId(j.data);
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: '纹理放大仍在进行，稍后用 tripo_download' };
+    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
+  }
+
   if (name === 'tripo_download') {
     const res = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`, args.format || 'glb');
     if (res.dir) {
@@ -547,7 +737,7 @@ rl.on('line', async (line) => {
   const { id, method, params } = req;
   try {
     if (method === 'initialize') {
-      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.3.0' } } });
+      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.4.0' } } });
     } else if (method === 'tools/list') {
       send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
     } else if (method === 'tools/call') {
@@ -562,4 +752,5 @@ rl.on('line', async (line) => {
     if (id !== undefined) send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ERROR: ' + e.message }], isError: true } });
   }
 });
+
 
