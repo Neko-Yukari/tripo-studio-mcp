@@ -532,6 +532,48 @@ const TOOLS = [
     },
   },
   {
+    name: 'tripo_segment',
+    description: '部件拆分，对应内部接口 operation/ai_segmentation。只支持未经重拓扑的原始网格；重拓扑过的项目会没反应。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        granularity: { type: 'string', enum: ['coarse', 'balanced', 'fine'], description: '拆分精度，默认 balanced（对应粗瞄/标准/精细）' },
+        model_version: { type: 'string', description: '默认 v2.0-20260430' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
+    name: 'tripo_complete',
+    description: '部件补全，对应内部接口 operation/ai_completion。用于给拆分后的残缺部件补全几何。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        part_names: { type: 'array', items: { type: 'string' }, description: '要补全的部件节点名' },
+        model_version: { type: 'string', description: '默认 v2.0-20260430' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['project_id', 'part_names'],
+    },
+  },
+  {
+    name: 'tripo_pbr',
+    description: '生成 PBR 材质，对应内部接口 operation/pbr_generate。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        model_version: { type: 'string', description: '默认 v1.0-20250506' },
+        part_name_list: { type: 'array', items: { type: 'string' }, description: '默认不限定部件' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
     name: 'tripo_download',
     description: '把一个已有项目（project_id）的模型下载到本地。format 可选 glb / fbx / obj / stl，后三种在本地用 assimp 转换；FBX 和 OBJ 会连同贴图解到同名目录。',
     inputSchema: {
@@ -714,6 +756,42 @@ async function callTool(name, args) {
     return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
   }
 
+  if (name === 'tripo_segment') {
+    const body = {
+      project_id: args.project_id,
+      segmentation_granularity: args.granularity || 'balanced',
+      model_version: args.model_version || 'v2.0-20260430',
+    };
+    const j = await api('POST', '/operation/ai_segmentation', body);
+    const id = progressId(j.data);
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: '拆分仍在进行，稍后用 tripo_download' };
+    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目已拆成多部件，用 tripo_download 取结果' };
+  }
+
+  if (name === 'tripo_complete') {
+    const body = {
+      project_id: args.project_id,
+      part_names: args.part_names,
+      model_version: args.model_version || 'v2.0-20260430',
+    };
+    const j = await api('POST', '/operation/ai_completion', body);
+    const id = progressId(j.data);
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: '补全仍在进行，稍后用 tripo_download' };
+    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
+  }
+
+  if (name === 'tripo_pbr') {
+    const body = { project_id: args.project_id, model_version: args.model_version || 'v1.0-20250506' };
+    if (args.part_name_list && args.part_name_list.length) body.part_name_list = args.part_name_list;
+    const j = await api('POST', '/operation/pbr_generate', body);
+    const id = progressId(j.data);
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: 'PBR 仍在生成，稍后用 tripo_download' };
+    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
+  }
+
   if (name === 'tripo_download') {
     const res = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`, args.format || 'glb');
     if (res.dir) {
@@ -737,7 +815,7 @@ rl.on('line', async (line) => {
   const { id, method, params } = req;
   try {
     if (method === 'initialize') {
-      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.4.0' } } });
+      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.5.0' } } });
     } else if (method === 'tools/list') {
       send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
     } else if (method === 'tools/call') {
@@ -752,5 +830,6 @@ rl.on('line', async (line) => {
     if (id !== undefined) send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ERROR: ' + e.message }], isError: true } });
   }
 });
+
 
 

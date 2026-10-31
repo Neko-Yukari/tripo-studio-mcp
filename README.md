@@ -29,6 +29,9 @@ Use it if you already pay for Studio and want an agent to produce assets in bulk
 | `tripo_uv` | Smart UV unwrap |
 | `tripo_rig` | Automatic rigging (built for humanoid shapes) |
 | `tripo_upscale` | Texture upscaling |
+| `tripo_segment` | Splits a mesh into parts (coarse / balanced / fine) |
+| `tripo_complete` | Completes missing geometry on named parts |
+| `tripo_pbr` | Generates PBR materials |
 | `tripo_download` | Downloads a model again by `project_id`; `format` picks glb, fbx, obj or stl |
 
 Parameter names follow the [official docs](https://platform.tripo3d.ai/docs/generation), so anything you already know from the official API carries over:

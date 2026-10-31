@@ -29,6 +29,9 @@ Studio 订阅正好相反，按月收费。Pro 大约每月 ¥140 含 3000 积�
 | `tripo_uv` | 智能 UV 展开 |
 | `tripo_rig` | 自动骨骼绑定（面向人形） |
 | `tripo_upscale` | 纹理放大 |
+| `tripo_segment` | 部件拆分（粗略/标准/精细） |
+| `tripo_complete` | 部件补全 |
+| `tripo_pbr` | 生成 PBR 材质 |
 | `tripo_download` | 按 `project_id` 重新下载模型，`format` 可选 glb、fbx、obj、stl |
 
 参数名跟[官方文档](https://platform.tripo3d.ai/docs/generation)保持一致，你在官方 API 上会的用法可以直接搬过来：
