@@ -1,6 +1,6 @@
 {
   "name": "tripo-studio-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "MCP server that generates 3D models with a Tripo Studio subscription (unofficial internal API).",
   "type": "module",
   "bin": { "tripo-studio-mcp": "server.mjs" },
@@ -16,6 +16,7 @@
   "license": "MIT",
   "keywords": ["mcp", "tripo", "3d", "glb", "model-generation"]
 }
+
 
 
 

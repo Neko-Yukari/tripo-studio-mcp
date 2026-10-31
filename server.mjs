@@ -258,9 +258,15 @@ async function waitTask(id, timeoutMs) {  const t0 = Date.now();
   return { ...last, timedOut: true, id };
 }
 
-async function downloadModel(projectId, outPath, format = 'glb') {
+async function downloadModel(projectId, outPath, format = 'glb', animated = false) {
   const det = await api('GET', `/project/detail/v3/${projectId}?locale=zh-CN`);
-  const url = det?.data?.model_url;
+  let url = det?.data?.model_url;
+  if (animated) {
+    // 动画不在主模型上，而在 operator.retarget[] 的 model_url 里
+    const list = det?.data?.operator?.retarget || [];
+    const latest = list.filter((x) => x.status === 'success' && x.model_url)[0];
+    if (latest) url = latest.model_url;
+  }
   if (!url) throw new Error('项目里没有 model_url');
   const r = await request('GET', url, { binary: true });
   if (r.status !== 200) throw new Error('下载失败 HTTP ' + r.status);
@@ -574,6 +580,21 @@ const TOOLS = [
     },
   },
   {
+    name: 'tripo_animate',
+    description: '文字生成动画并套到已绑定的模型上。内部先用 motion/generate 生成动作资产，再调 operation/retarget_model 重定向；模型必须先 tripo_rig。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        prompt: { type: 'string', description: '动作描述，例如 walk forward slowly' },
+        duration_seconds: { type: 'integer', description: '时长（秒），默认 5' },
+        rig_type: { type: 'string', description: '骨骼类型，默认 biped' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['project_id', 'prompt'],
+    },
+  },
+  {
     name: 'tripo_download',
     description: '把一个已有项目（project_id）的模型下载到本地。format 可选 glb / fbx / obj / stl，后三种在本地用 assimp 转换；FBX 和 OBJ 会连同贴图解到同名目录。',
     inputSchema: {
@@ -582,6 +603,7 @@ const TOOLS = [
         project_id: { type: 'string' },
         format: { type: 'string', enum: ['glb', 'fbx', 'obj', 'stl'], description: '默认 glb' },
         out_path: { type: 'string', description: '默认 tripo-out/<project_id>.glb；转换格式的扩展名会自动替换' },
+        animated: { type: 'boolean', description: '下载已套用的动画 GLB：只含骨骼和动画轨道、没有网格，在 Blender 里叠加到绑定后的静态模型上使用；默认 false' },
       },
       required: ['project_id'],
     },
@@ -792,8 +814,39 @@ async function callTool(name, args) {
     return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
   }
 
+  if (name === 'tripo_animate') {
+    const gen = await api('POST', '/motion/generate', {
+      segments: [{ duration_seconds: args.duration_seconds || 5, prompt: args.prompt }],
+    });
+    const taskId = gen?.data?.task_id;
+    if (!taskId) throw new Error('动作任务没拿到 task_id');
+
+    // 轮询动作资产生成
+    const deadline = Date.now() + (args.wait_seconds || 480) * 1000;
+    let assetId = gen?.data?.asset_id || null;
+    while (!assetId) {
+      if (Date.now() > deadline) return { task_id: taskId, status: 'timeout', note: '动作仍在生成，稍后重试' };
+      await new Promise((r) => setTimeout(r, 5000));
+      const t = await api('POST', '/motion/get_task', { task_id: taskId });
+      const st = t?.data?.status;
+      if (st === 'failed') throw new Error('动作生成失败: ' + (t?.data?.error || ''));
+      assetId = t?.data?.asset_id || null;
+    }
+
+    const rt = await api('POST', '/operation/retarget_model', {
+      project_id: args.project_id,
+      motion_asset_id: assetId,
+      model_version: 'default',
+      rig_type: args.rig_type || 'biped',
+    });
+    const id = progressId(rt.data);
+    const st = await waitTask(id, Math.max(10000, deadline - Date.now()));
+    if (st.timedOut) return { task_id: taskId, asset_id: assetId, operator_id: id, status: st.status, note: '动作已生成，重定向仍在进行' };
+    return { task_id: taskId, asset_id: assetId, operator_id: id, status: st.status, note: '动画已套到项目模型，用 tripo_download 取结果' };
+  }
+
   if (name === 'tripo_download') {
-    const res = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`, args.format || 'glb');
+    const res = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`, args.format || 'glb', !!args.animated);
     if (res.dir) {
       return { dir: res.dir, format: res.format, files: res.files.map((f) => ({ file: f.path, bytes: f.bytes })) };
     }
@@ -815,7 +868,7 @@ rl.on('line', async (line) => {
   const { id, method, params } = req;
   try {
     if (method === 'initialize') {
-      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.5.0' } } });
+      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.6.0' } } });
     } else if (method === 'tools/list') {
       send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
     } else if (method === 'tools/call') {
@@ -830,6 +883,7 @@ rl.on('line', async (line) => {
     if (id !== undefined) send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ERROR: ' + e.message }], isError: true } });
   }
 });
+
 
 
 

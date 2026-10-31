@@ -32,6 +32,7 @@ Use it if you already pay for Studio and want an agent to produce assets in bulk
 | `tripo_segment` | Splits a mesh into parts (coarse / balanced / fine) |
 | `tripo_complete` | Completes missing geometry on named parts |
 | `tripo_pbr` | Generates PBR materials |
+| `tripo_animate` | Text → motion clip, retargeted onto a rigged model; fetch it with `tripo_download` and `animated: true` |
 | `tripo_download` | Downloads a model again by `project_id`; `format` picks glb, fbx, obj or stl |
 
 Parameter names follow the [official docs](https://platform.tripo3d.ai/docs/generation), so anything you already know from the official API carries over:

@@ -1,0 +1,11 @@
+import fs from "node:fs";
+const buf = fs.readFileSync("tripo-out/anim.glb");
+const len = buf.readUInt32LE(12);
+const j = JSON.parse(buf.subarray(20, 20 + len).toString("utf8"));
+console.log("meshes:", j.meshes.map((m) => `${m.name}:${m.primitives.length}`).join(", "));
+const prim = j.meshes[0].primitives[0];
+console.log("attrs:", Object.keys(prim.attributes).join(","));
+console.log("indices count:", j.accessors[prim.indices]?.count, "=> 三角面", (j.accessors[prim.indices]?.count || 0) / 3);
+console.log("pos count:", j.accessors[prim.attributes.POSITION]?.count);
+console.log("images:", (j.images || []).length, "materials:", (j.materials || []).length);
+console.log("extensions:", (j.extensionsUsed || []).join(","));
