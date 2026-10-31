@@ -20,7 +20,7 @@ Studio 订阅正好相反，按月收费。Pro 大约每月 ¥140 含 3000 积�
 
 | 工具 | 作用 |
 |---|---|
-| `tripo_status` | 查看套餐、到期时间和自动续费状态，也能查单个操作的进度 |
+| `tripo_status` | 查看套餐、到期时间、自动续费和特殊额度余额，也能查单个操作的进度 |
 | `tripo_generate_text` | 文字生成模型，等到生成完成后下载 GLB |
 | `tripo_generate_image` | 参考图生成模型，会先上传图片并送审，再下载 GLB |
 | `tripo_download` | 按 `project_id` 重新下载模型 |
@@ -88,7 +88,9 @@ magpie library mcp add tripo-studio node /absolute/path/to/server.mjs agents=ope
 
 ## 已知限制
 
-- **只有 GLB。** Studio 导出 FBX/OBJ/STL 走的是另一条路径。`operation/export` 能接任务，但成品下载地址还没摸通。Blender 本身就能读 GLB，所以主要用途不受影响。
+- **只有 GLB，而且是设计如此。** Studio 服务端不提供其他格式。网页里导出 FBX/OBJ/STL 时，它会先把同一个 GLB 下下来，再用浏览器里的 Assimp WASM 转，`operation/export-lite` 只负责记账，返回的是空 data。需要别的格式就在本地转。
+- **多视图未验证。** `operation/multiview_to_model` 这个接口确实存在，但在无头会话里四个视角槽位始终填不上，提交按钮一直是灰的，所以它的请求体还没拿到。单图和文字两条路是完整可用的。
+- **资产列表未验证。** `/v2/studio/assets/v2` 会拒绝我试过的所有 `type` 取值，资产页的数据又是服务端直出的，所以那个枚举值还不知道。生成接口会返回 `project_id`，取模型够用了。
 - **没有 webhook。** 服务端靠轮询 `progress` 拿状态，工具默认最多等 8 分钟。超时后你会拿到 `operator_id` 和 `project_id`，之后用 `tripo_download` 取模型。
 - **只支持单张图。** 内部走的是 `batch_image_to_model` 的数组形式。多视图的 `multiview_to_model` 没有接。
 - **会话会过期**，一般是一个月左右。
@@ -103,6 +105,7 @@ magpie library mcp add tripo-studio node /absolute/path/to/server.mjs agents=ope
 图片：POST /v2/studio/operation/batch_image_to_model → [{project_id, operator_id}]
 轮询：POST /v2/studio/progress  {ids:[id]}           → status / progress / left_time
 取件：GET  /v2/studio/project/detail/v3/{project_id} → data.model_url（S3 签名地址）
+额度：POST /v2/studio/operation/quota             → 特殊额度池
 ```
 
 上传图片分三步走：
@@ -120,6 +123,7 @@ POST /v2/studio/audit/image {image:{bucket,key}}                        → {res
 3. 图片参数是**数组**，每一项都要带 `image_audit_result` 和 `image_source`。少任何一个都会返回 `11002 Image audit result not found`，这条错误信息会让人以为是审核没过，其实是请求体字段不全。
 4. `image` 只接受 `{bucket, key}` 对象。传字符串或者 URL 一律返回 `1004`。
 5. `progress` 偶尔会返回 502，所以轮询要能扛住连续几次失败。
+6. 导出这条路在服务端是走不通的。`operation/export-lite` 返回 `{data:{}}`，然后由浏览器用 `/_assimp/wasm/assimpjs-meshopt` 自己转格式。任何试图拉服务端 FBX 的做法都会撞上 `download_with_name` 的 `13001 Operator not found`。
 
 ## 安全
 

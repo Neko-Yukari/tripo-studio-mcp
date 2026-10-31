@@ -321,6 +321,10 @@ async function callTool(name, args) {
         valid_until: p.data?.subscription?.valid_until, auto_renew: p.data?.subscription?.auto_renew,
       };
     } catch (e) { out.member = { error: String(e.message).slice(0, 160) }; }
+    try {
+      const q = await api('POST', '/operation/quota', {});
+      out.quota = q.data?.quota || q.data || null;
+    } catch (e) { out.quota = { error: String(e.message).slice(0, 160) }; }
     if (args.task_id) {
       const j = await api('POST', '/progress', { ids: [args.task_id] });
       out.task = (j.data || [])[0];

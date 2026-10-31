@@ -20,7 +20,7 @@ Use it if you already pay for Studio and want an agent to produce assets in bulk
 
 | Tool | What it does |
 |---|---|
-| `tripo_status` | Shows plan, expiry and auto-renew; can also poll one operation's progress |
+| `tripo_status` | Shows plan, expiry and auto-renew, plus any special quota pools; can also poll one operation's progress |
 | `tripo_generate_text` | Text prompt → 3D model; waits for completion and downloads the GLB |
 | `tripo_generate_image` | Reference image → 3D model; uploads the image and passes its moderation check first |
 | `tripo_download` | Downloads a model again by `project_id` |
@@ -88,7 +88,9 @@ Every generation spends Studio subscription credits: about 55 for a default text
 
 ## Known limits
 
-- **GLB only.** Studio's FBX/OBJ/STL export runs through a separate path. `operation/export` does accept a job, but the download URL for the result is still unresolved. Since Blender imports GLB natively, GLB covers the main use case.
+- **GLB only, by design.** Studio does not serve other formats. When you export FBX/OBJ/STL in the web app, it downloads the same GLB and converts it in your browser with an Assimp WASM worker; `operation/export-lite` only records the action and answers with an empty payload. Convert the GLB locally if you need another format.
+- **Multi-view is unverified.** The endpoint `operation/multiview_to_model` exists, but the four view slots refused to fill in a headless session, so its request body is still unknown. Single image and text are fully working.
+- **Asset listing is unverified.** `/v2/studio/assets/v2` rejects every `type` value tried, and the assets page renders from server-side data, so the enum is still unknown. Generation returns `project_id`, which is enough to fetch a model.
 - **No webhooks.** The server polls `progress` instead. A tool waits up to 8 minutes by default; if it times out you get `operator_id` and `project_id`, and can fetch the model later with `tripo_download`.
 - **Single image only.** Internally this goes through the array form of `batch_image_to_model`. Multi-view `multiview_to_model` is not wired up.
 - **The cookie expires**, usually after about a month.
@@ -103,6 +105,7 @@ text:   POST /v2/studio/operation/text_to_model       → task_id + project_id
 image:  POST /v2/studio/operation/batch_image_to_model → [{project_id, operator_id}]
 poll:   POST /v2/studio/progress  {ids:[id]}           → status / progress / left_time
 fetch:  GET  /v2/studio/project/detail/v3/{project_id} → data.model_url (signed S3 URL)
+quota:  POST /v2/studio/operation/quota             → special quota pools
 ```
 
 Image upload takes three steps:
@@ -120,6 +123,7 @@ Five things cost real time to find:
 3. The image payload is an **array**, and every item needs both `image_audit_result` and `image_source`. Miss either one and you get `11002 Image audit result not found` — a message that invites you to re-run moderation, when the real problem is an incomplete request body.
 4. `image` only accepts a `{bucket, key}` object. A string or a URL returns `1004`.
 5. `progress` occasionally answers 502, so polling has to survive several consecutive failures.
+6. Export is a dead end on the server side. `operation/export-lite` returns `{data:{}}` and the browser then converts the GLB itself with `/_assimp/wasm/assimpjs-meshopt`. Anything that claims to fetch a server-side FBX will fail with `download_with_name` → `13001 Operator not found`.
 
 ## Security
 
