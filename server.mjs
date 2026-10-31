@@ -8,12 +8,18 @@ import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import readline from 'node:readline';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 
 const HOME = path.join(os.homedir(), '.tripo');
 const STATE = process.env.TRIPO_STUDIO_STATE || path.join(HOME, 'studio-state.json');
 const CONFIG = process.env.TRIPO_STUDIO_CONFIG || path.join(HOME, 'config.json');
 const BASE = 'https://api.tripo3d.ai/v2/studio';
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ASSIMP_DIR = process.env.TRIPO_ASSIMP_DIR || path.join(HERE, 'vendor', 'assimp');
+const require = createRequire(import.meta.url);
 const UA = process.env.TRIPO_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36';
 
 function readConfig() {
@@ -195,7 +201,7 @@ async function waitTask(id, timeoutMs) {
   return { ...last, timedOut: true, id };
 }
 
-async function downloadModel(projectId, outPath) {
+async function downloadModel(projectId, outPath, format = 'glb') {
   const det = await api('GET', `/project/detail/v3/${projectId}?locale=zh-CN`);
   const url = det?.data?.model_url;
   if (!url) throw new Error('项目里没有 model_url');
@@ -203,8 +209,90 @@ async function downloadModel(projectId, outPath) {
   if (r.status !== 200) throw new Error('下载失败 HTTP ' + r.status);
   const dest = path.resolve(outPath);
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.writeFileSync(dest, r.buf);
-  return { path: dest, bytes: r.buf.length };
+  if (format === 'glb') {
+    fs.writeFileSync(dest, r.buf);
+    return { path: dest, bytes: r.buf.length, format: 'glb' };
+  }
+  const base = path.basename(dest, path.extname(dest));
+  const files = await convertModel(r.buf, format, base);
+  if (files.length === 1 && !files[0].archive) {
+    const single = path.join(path.dirname(dest), `${base}.${format}`);
+    fs.writeFileSync(single, files[0].data);
+    return { path: single, bytes: files[0].data.length, format };
+  }
+  const dir = path.join(path.dirname(dest), base);
+  const written = [];
+  for (const f of files) {
+    const p = path.join(dir, f.name);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, f.data);
+    written.push({ path: p, bytes: f.data.length });
+  }
+  return { dir, files: written, format };
+}
+
+/* ---------- 格式转换：assimp wasm ---------- */
+
+let assimpModule = null;
+
+async function convertModel(glbBuf, format, name) {
+  if (!['fbx', 'obj', 'stl'].includes(format)) throw new Error(`不支持的格式：${format}`);
+  if (!assimpModule) {
+    const js = path.join(ASSIMP_DIR, 'assimpjs.cjs');
+    const wasm = path.join(ASSIMP_DIR, 'assimpjs.wasm');
+    if (!fs.existsSync(js) || !fs.existsSync(wasm)) {
+      throw new Error(`找不到 assimp 转换器（${ASSIMP_DIR}），可用 TRIPO_ASSIMP_DIR 指定目录`);
+    }
+    const factory = require(js);
+    assimpModule = await (typeof factory === 'function' ? factory : factory.default || factory.assimpjs)({ locateFile: () => wasm });
+  }
+  const list = new assimpModule.FileList();
+  list.AddFile('model.glb', new Uint8Array(glbBuf));
+  const result = assimpModule.ConvertFileList(list, format, {}, name);
+  if (!result.IsSuccess() || result.FileCount() === 0) {
+    throw new Error(`转换 ${format} 失败：${result.GetErrorCode()}`);
+  }
+  const out = [];
+  for (let i = 0; i < result.FileCount(); i++) {
+    const f = result.GetFile(i);
+    const data = Buffer.from(f.GetContent());
+    const entry = f.GetPath?.() || f.GetName?.() || `result.${format}`;
+    if (data[0] === 0x50 && data[1] === 0x4b && data[2] === 0x03 && data[3] === 0x04) {
+      for (const z of readZip(data)) out.push({ name: z.name, data: z.data, archive: true });
+    } else {
+      out.push({ name: path.basename(entry), data, archive: false });
+    }
+  }
+  result.delete?.();
+  list.delete?.();
+  return out;
+}
+
+function readZip(buf) {
+  let eocd = -1;
+  const stop = Math.max(0, buf.length - 66000);
+  for (let i = buf.length - 22; i >= stop; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('zip 结构损坏');
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error('zip 目录损坏');
+    const method = buf.readUInt16LE(p + 10);
+    const csize = buf.readUInt32LE(p + 20);
+    const nlen = buf.readUInt16LE(p + 28);
+    const elen = buf.readUInt16LE(p + 30);
+    const clen = buf.readUInt16LE(p + 32);
+    const lho = buf.readUInt32LE(p + 42);
+    const entryName = buf.subarray(p + 46, p + 46 + nlen).toString('utf8');
+    const dataStart = lho + 30 + buf.readUInt16LE(lho + 26) + buf.readUInt16LE(lho + 28);
+    const raw = buf.subarray(dataStart, dataStart + csize);
+    out.push({ name: entryName, data: method === 0 ? raw : zlib.inflateRawSync(raw) });
+    p += 46 + nlen + elen + clen;
+  }
+  return out;
 }
 
 function slug(s) {
@@ -294,12 +382,13 @@ const TOOLS = [
   },
   {
     name: 'tripo_download',
-    description: '把一个已有项目（project_id）的 GLB 下载到本地。',
+    description: '把一个已有项目（project_id）的模型下载到本地。format 可选 glb / fbx / obj / stl，后三种在本地用 assimp 转换；FBX 和 OBJ 会连同贴图解到同名目录。',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
-        out_path: { type: 'string', description: '默认 tripo-out/<project_id>.glb' },
+        format: { type: 'string', enum: ['glb', 'fbx', 'obj', 'stl'], description: '默认 glb' },
+        out_path: { type: 'string', description: '默认 tripo-out/<project_id>.glb；转换格式的扩展名会自动替换' },
       },
       required: ['project_id'],
     },
@@ -370,8 +459,11 @@ async function callTool(name, args) {
   }
 
   if (name === 'tripo_download') {
-    const file = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`);
-    return { file: file.path, bytes: file.bytes };
+    const res = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`, args.format || 'glb');
+    if (res.dir) {
+      return { dir: res.dir, format: res.format, files: res.files.map((f) => ({ file: f.path, bytes: f.bytes })) };
+    }
+    return { file: res.path, bytes: res.bytes, format: res.format };
   }
 
   throw new Error('unknown tool ' + name);
@@ -389,7 +481,7 @@ rl.on('line', async (line) => {
   const { id, method, params } = req;
   try {
     if (method === 'initialize') {
-      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.1.0' } } });
+      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.2.0' } } });
     } else if (method === 'tools/list') {
       send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
     } else if (method === 'tools/call') {

@@ -23,7 +23,7 @@ Studio 订阅正好相反，按月收费。Pro 大约每月 ¥140 含 3000 积�
 | `tripo_status` | 查看套餐、到期时间、自动续费和特殊额度余额，也能查单个操作的进度 |
 | `tripo_generate_text` | 文字生成模型，等到生成完成后下载 GLB |
 | `tripo_generate_image` | 参考图生成模型，会先上传图片并送审，再下载 GLB |
-| `tripo_download` | 按 `project_id` 重新下载模型 |
+| `tripo_download` | 按 `project_id` 重新下载模型，`format` 可选 glb、fbx、obj、stl |
 
 参数名跟[官方文档](https://platform.tripo3d.ai/docs/generation)保持一致，你在官方 API 上会的用法可以直接搬过来：
 
@@ -88,7 +88,8 @@ magpie library mcp add tripo-studio node /absolute/path/to/server.mjs agents=ope
 
 ## 已知限制
 
-- **只有 GLB，而且是设计如此。** Studio 服务端不提供其他格式。网页里导出 FBX/OBJ/STL 时，它会先把同一个 GLB 下下来，再用浏览器里的 Assimp WASM 转，`operation/export-lite` 只负责记账，返回的是空 data。需要别的格式就在本地转。
+- **GLB 以外的格式在本地转换。** Studio 服务端只给 GLB：网页里导出 FBX/OBJ/STL 时，它也是先把同一个 GLB 下下来、再用浏览器里的 Assimp WASM 转，`operation/export-lite` 只负责记账。本服务器在你机器上做同样的转换，用的是内置的 Assimp 构建，所以 `format: "fbx" | "obj" | "stl"` 离线可用。FBX 和 OBJ 会连同贴图放进一个同名目录。
+- **转换需要 meshopt 解码器。** Tripo 的 GLB 是 gltfpack 压过的，带 `EXT_meshopt_compression` 和 `KHR_mesh_quantization`，官方原生 Assimp 读不了。内置的这份两者都支持，想换成自建版本看 `vendor/assimp/README.md`。
 - **多视图未验证。** `operation/multiview_to_model` 这个接口确实存在，但在无头会话里四个视角槽位始终填不上，提交按钮一直是灰的，所以它的请求体还没拿到。单图和文字两条路是完整可用的。
 - **资产列表未验证。** `/v2/studio/assets/v2` 会拒绝我试过的所有 `type` 取值，资产页的数据又是服务端直出的，所以那个枚举值还不知道。生成接口会返回 `project_id`，取模型够用了。
 - **没有 webhook。** 服务端靠轮询 `progress` 拿状态，工具默认最多等 8 分钟。超时后你会拿到 `operator_id` 和 `project_id`，之后用 `tripo_download` 取模型。

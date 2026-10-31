@@ -23,7 +23,7 @@ Use it if you already pay for Studio and want an agent to produce assets in bulk
 | `tripo_status` | Shows plan, expiry and auto-renew, plus any special quota pools; can also poll one operation's progress |
 | `tripo_generate_text` | Text prompt → 3D model; waits for completion and downloads the GLB |
 | `tripo_generate_image` | Reference image → 3D model; uploads the image and passes its moderation check first |
-| `tripo_download` | Downloads a model again by `project_id` |
+| `tripo_download` | Downloads a model again by `project_id`; `format` picks glb, fbx, obj or stl |
 
 Parameter names follow the [official docs](https://platform.tripo3d.ai/docs/generation), so anything you already know from the official API carries over:
 
@@ -88,7 +88,8 @@ Every generation spends Studio subscription credits: about 55 for a default text
 
 ## Known limits
 
-- **GLB only, by design.** Studio does not serve other formats. When you export FBX/OBJ/STL in the web app, it downloads the same GLB and converts it in your browser with an Assimp WASM worker; `operation/export-lite` only records the action and answers with an empty payload. Convert the GLB locally if you need another format.
+- **Formats other than GLB are converted locally.** Studio serves only GLB: when you export FBX/OBJ/STL in its web app, it downloads the same GLB and converts it in your browser with an Assimp WASM worker, and `operation/export-lite` merely records the action. This server does the same conversion on your machine with a bundled Assimp build, so `format: "fbx" | "obj" | "stl"` works offline. FBX and OBJ come out as a folder holding the model plus its textures.
+- **Conversion needs the meshopt decoder.** Tripo's GLB is gltfpack output using `EXT_meshopt_compression` and `KHR_mesh_quantization`; a stock Assimp cannot read it. The bundled build handles both. See `vendor/assimp/README.md` for how to swap in your own build.
 - **Multi-view is unverified.** The endpoint `operation/multiview_to_model` exists, but the four view slots refused to fill in a headless session, so its request body is still unknown. Single image and text are fully working.
 - **Asset listing is unverified.** `/v2/studio/assets/v2` rejects every `type` value tried, and the assets page renders from server-side data, so the enum is still unknown. Generation returns `project_id`, which is enough to fetch a model.
 - **No webhooks.** The server polls `progress` instead. A tool waits up to 8 minutes by default; if it times out you get `operator_id` and `project_id`, and can fetch the model later with `tripo_download`.

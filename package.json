@@ -1,11 +1,11 @@
 {
   "name": "tripo-studio-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server that generates 3D models with a Tripo Studio subscription (unofficial internal API).",
   "type": "module",
   "bin": { "tripo-studio-mcp": "server.mjs" },
   "main": "server.mjs",
-  "files": ["server.mjs", "login.mjs", "README.md", "README.zh-CN.md", "LICENSE"],
+  "files": ["server.mjs", "login.mjs", "vendor/", "README.md", "README.zh-CN.md", "LICENSE"],
   "scripts": {
     "start": "node server.mjs",
     "login": "node login.mjs",
