@@ -52,28 +52,29 @@ function tunnelSocket(proxyUrl, host, port) {
   });
 }
 
-async function request(method, urlStr, { headers = {}, body = null, binary = false } = {}) {
+async function request(method, urlStr, { headers = {}, body = null, binary = false, direct = undefined } = {}) {
   const u = new URL(urlStr);
   const host = u.hostname;
   const port = u.port || 443;
-  const opts = { method, host, port, path: u.pathname + u.search, headers: { ...headers, host } };
-  if (body) opts.headers['content-length'] = Buffer.byteLength(body);
+  // S3 走代理时常在 TLS 握手阶段被重置，这类主机默认直连
+  const defaultProxy = direct !== undefined ? !direct : Boolean(PROXY) && !/(^|\.)amazonaws\.com$/.test(host);
 
-  if (PROXY) {
-    const agent = new https.Agent({ keepAlive: false });
-    agent.createConnection = (o, cb) => {
-      tunnelSocket(PROXY, host, port)
-        .then((sock) => {
-          const t = tls.connect({ socket: sock, servername: host });
-          t.once('secureConnect', () => cb(null, t));
-          t.once('error', cb);
-        })
-        .catch(cb);
-    };
-    opts.agent = agent;
-  }
-
-  return new Promise((resolve, reject) => {
+  const attempt = (withProxy) => new Promise((resolve, reject) => {
+    const opts = { method, host, port, path: u.pathname + u.search, headers: { ...headers, host } };
+    if (body) opts.headers['content-length'] = Buffer.byteLength(body);
+    if (withProxy) {
+      const agent = new https.Agent({ keepAlive: false });
+      agent.createConnection = (o, cb) => {
+        tunnelSocket(PROXY, host, port)
+          .then((sock) => {
+            const t = tls.connect({ socket: sock, servername: host });
+            t.once('secureConnect', () => cb(null, t));
+            t.once('error', cb);
+          })
+          .catch(cb);
+      };
+      opts.agent = agent;
+    }
     const req = https.request(opts, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
@@ -86,6 +87,14 @@ async function request(method, urlStr, { headers = {}, body = null, binary = fal
     if (body) req.write(body);
     req.end();
   });
+
+  try {
+    return await attempt(defaultProxy);
+  } catch (e) {
+    // 代理连通性坏掉时退回直连，避免整条上传链路被挡死
+    if (defaultProxy && ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'].includes(e.code)) return attempt(false);
+    throw e;
+  }
 }
 
 /* ---------- 会话 ---------- */
@@ -162,6 +171,9 @@ const GENERATE_DEFAULTS = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 面数预设：直接调 face_limit 太容易抳出百兆模型，给个台阶
+const FACE_PRESETS = { low: 30000, medium: 150000, high: 800000 };
+
 // 官方 API 文档里的参数名，原样透传（见 platform.tripo3d.ai/docs/generation）
 const OFFICIAL_PARAMS = [
   'face_limit', 'texture', 'pbr', 'quad', 'texture_quality', 'geometry_quality',
@@ -171,6 +183,11 @@ const OFFICIAL_PARAMS = [
 ];
 
 function applyParams(body, args) {
+  if (args.face_preset) {
+    const n = FACE_PRESETS[args.face_preset];
+    if (!n) throw new Error('face_preset 只能是 low / medium / high');
+    body.face_limit = n;
+  }
   for (const k of OFFICIAL_PARAMS) {
     if (args[k] !== undefined) body[k] = args[k];
   }
@@ -326,6 +343,7 @@ const MODEL_VERSIONS = [
 const GEN_PARAMS = {
   model_version: { type: 'string', enum: MODEL_VERSIONS, description: '模型版本，默认 v3.1-20260211；P1 系列支持四边面' },
   face_limit: { type: 'integer', description: '面数上限，不填自适应。v3.1/v3.0 detailed 最多 2,000,000、standard 1,500,000；v2.5 最多 500,000；quad=true 时不超过 150,000' },
+  face_preset: { type: 'string', enum: ['low', 'medium', 'high'], description: '面数预设：low 3万 / medium 15万 / high 80万，优先于 face_limit；游戏资产和 3D 打印建议 low 或 medium' },
   texture: { type: 'boolean', description: '是否生成贴图，默认 true' },
   pbr: { type: 'boolean', description: 'PBR 材质，默认 true；为 true 时 texture 被强制为 true' },
   texture_quality: { type: 'string', enum: ['standard', 'detailed', 'extreme'], description: '贴图质量，默认 detailed；standard 为基准，detailed +20、extreme +30 积分' },
@@ -378,6 +396,25 @@ const TOOLS = [
         ...GEN_PARAMS,
       },
       required: ['image_path'],
+    },
+  },
+  {
+    name: 'tripo_generate_multiview',
+    description: '多视图生成 3D 模型：给 2~4 张同一物体的不同视角图，对应内部接口 operation/multiview_to_model。数组顺序即视角顺序，默认按 front、left、right、back 理解；每张图都会先上传并送审。默认阻塞等待并下载 GLB。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        image_paths: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 2,
+          maxItems: 4,
+          description: '2~4 张本地图片，按 front、left、right、back 的顺序排列',
+        },
+        out_path: { type: 'string', description: '保存路径，默认 tripo-out/<第一张文件名>-mv.glb' },
+        ...GEN_PARAMS,
+      },
+      required: ['image_paths'],
     },
   },
   {
@@ -458,6 +495,35 @@ async function callTool(name, args) {
     return { operator_id: opId, project_id, status: st.status, file: file.path, bytes: file.bytes };
   }
 
+  if (name === 'tripo_generate_multiview') {
+    const paths = args.image_paths || [];
+    if (paths.length < 2 || paths.length > 4) throw new Error('image_paths 需要 2~4 张图片');
+    const images = [];
+    for (const p of paths) {
+      if (!fs.existsSync(p)) throw new Error('找不到图片: ' + p);
+      const img = await uploadImage(p);
+      images.push({
+        bucket: img.bucket,
+        key: img.key,
+        image_audit_result: img.audit,
+        image_source: 'upload',
+        texture_quality: args.texture_quality || GENERATE_DEFAULTS.texture_quality,
+      });
+    }
+    const body = applyParams({
+      ...GENERATE_DEFAULTS,
+      model_version: args.model_version || DEFAULT_MODEL,
+      image: images,
+    }, args);
+    const j = await api('POST', '/operation/multiview_to_model', body);
+    const { task_id, project_id } = j.data;
+    const st = await waitTask(task_id, (args.wait_seconds || 480) * 1000);
+    if (st.timedOut) return { task_id, project_id, status: st.status, progress: st.progress, note: '仍在上色/生成，稍后用 tripo_download' };
+    const base = slug(path.basename(paths[0], path.extname(paths[0])));
+    const file = await downloadModel(project_id, args.out_path || `tripo-out/${base}-mv.glb`);
+    return { task_id, project_id, status: st.status, file: file.path, bytes: file.bytes };
+  }
+
   if (name === 'tripo_download') {
     const res = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`, args.format || 'glb');
     if (res.dir) {
@@ -481,7 +547,7 @@ rl.on('line', async (line) => {
   const { id, method, params } = req;
   try {
     if (method === 'initialize') {
-      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.2.0' } } });
+      send({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tripo-studio', version: '0.3.0' } } });
     } else if (method === 'tools/list') {
       send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
     } else if (method === 'tools/call') {
@@ -496,3 +562,4 @@ rl.on('line', async (line) => {
     if (id !== undefined) send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ERROR: ' + e.message }], isError: true } });
   }
 });
+

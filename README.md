@@ -23,11 +23,12 @@ Use it if you already pay for Studio and want an agent to produce assets in bulk
 | `tripo_status` | Shows plan, expiry and auto-renew, plus any special quota pools; can also poll one operation's progress |
 | `tripo_generate_text` | Text prompt → 3D model; waits for completion and downloads the GLB |
 | `tripo_generate_image` | Reference image → 3D model; uploads the image and passes its moderation check first |
+| `tripo_generate_multiview` | 2–4 views of one object (front, left, right, back) → 3D model |
 | `tripo_download` | Downloads a model again by `project_id`; `format` picks glb, fbx, obj or stl |
 
 Parameter names follow the [official docs](https://platform.tripo3d.ai/docs/generation), so anything you already know from the official API carries over:
 
-`model_version`, `face_limit`, `texture`, `pbr`, `texture_quality` (standard/detailed/extreme), `geometry_quality` (standard/detailed), `texture_alignment` (original_image/geometry), `quad`, `auto_size`, `orientation` (default/align_image), `compress` (geometry/meshopt), `smart_low_poly`, `generate_parts`, `export_uv`, `model_seed`, `texture_seed`, `visibility` (private/public/shareable).
+`model_version`, `face_limit`, `face_preset` (low 30k / medium 150k / high 800k), `texture`, `pbr`, `texture_quality` (standard/detailed/extreme), `geometry_quality` (standard/detailed), `texture_alignment` (original_image/geometry), `quad`, `auto_size`, `orientation` (default/align_image), `compress` (geometry/meshopt), `smart_low_poly`, `generate_parts`, `export_uv`, `model_seed`, `texture_seed`, `visibility` (private/public/shareable).
 
 A few defaults are worth knowing. `model_version` defaults to `v3.1-20260211` (H3.1 highest quality) and costs about 55 credits per run. Setting `quad=true` forces quad topology, and then `face_limit` cannot exceed 150,000. Setting `generate_parts=true` conflicts with `texture`, `pbr` and `quad`.
 
@@ -90,10 +91,10 @@ Every generation spends Studio subscription credits: about 55 for a default text
 
 - **Formats other than GLB are converted locally.** Studio serves only GLB: when you export FBX/OBJ/STL in its web app, it downloads the same GLB and converts it in your browser with an Assimp WASM worker, and `operation/export-lite` merely records the action. This server does the same conversion on your machine with a bundled Assimp build, so `format: "fbx" | "obj" | "stl"` works offline. FBX and OBJ come out as a folder holding the model plus its textures.
 - **Conversion needs the meshopt decoder.** Tripo's GLB is gltfpack output using `EXT_meshopt_compression` and `KHR_mesh_quantization`; a stock Assimp cannot read it. The bundled build handles both. See `vendor/assimp/README.md` for how to swap in your own build.
-- **Multi-view is unverified.** The endpoint `operation/multiview_to_model` exists, but the four view slots refused to fill in a headless session, so its request body is still unknown. Single image and text are fully working.
+- **Multi-view wants 2 to 4 images that match.** `operation/multiview_to_model` takes the same `image` array as the single-image endpoint, but every element must have been uploaded and pass the image audit first, and the array order is the view order: front, left, right, back. Two views are enough; four give the best silhouette.
+- **S3 uploads bypass the proxy.** The `PUT` to `tripo-data.s3.<region>.amazonaws.com` gets its TLS handshake reset when routed through a local proxy, so those hosts connect directly and a failing proxy falls back to direct automatically.
 - **Asset listing is unverified.** `/v2/studio/assets/v2` rejects every `type` value tried, and the assets page renders from server-side data, so the enum is still unknown. Generation returns `project_id`, which is enough to fetch a model.
 - **No webhooks.** The server polls `progress` instead. A tool waits up to 8 minutes by default; if it times out you get `operator_id` and `project_id`, and can fetch the model later with `tripo_download`.
-- **Single image only.** Internally this goes through the array form of `batch_image_to_model`. Multi-view `multiview_to_model` is not wired up.
 - **The cookie expires**, usually after about a month.
 - **No compatibility promise.** These are internal endpoints; a Tripo redesign can break them at any time.
 
