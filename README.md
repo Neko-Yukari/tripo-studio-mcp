@@ -99,6 +99,65 @@ Everything is an environment variable, and all of them have defaults.
 | `HTTPS_PROXY` | empty | Same as above, lower priority than `TRIPO_PROXY` |
 | `TRIPO_NO_PROXY` | empty | Set to anything to force a direct connection |
 | `TRIPO_USER_AGENT` | Chrome 156 UA | Rarely needs changing |
+| `TRIPO_GATEWAY` | empty | Set to `0` to stop the MCP server from starting the gateway |
+| `TRIPO_GATEWAY_PORT` | `8787` | Gateway port |
+| `TRIPO_GATEWAY_HOST` | `127.0.0.1` | Gateway listen address |
+| `TRIPO_GATEWAY_DIR` | `~/.tripo/gateway` | Key hashes, task records and cached outputs |
+| `TRIPO_GATEWAY_PUBLIC_URL` | derived from host and port | Prefix for download links; only needed behind a reverse proxy |
+| `TRIPO_GATEWAY_TLS_CERT` / `TRIPO_GATEWAY_TLS_KEY` | empty | Certificate and key; set both to serve HTTPS |
+
+## Official API gateway
+
+`gateway.mjs` runs a local HTTP server that speaks the official Tripo API, both V3 (`/v3/*`) and V2 (`/v2/openapi/*`). Point an official SDK, the CLI or the Blender add-on at it, give it a key the gateway issued, and the client works unchanged, except that it spends your Studio subscription credits.
+
+### Starting it
+
+Issue a key first:
+
+```bash
+node gateway.mjs keygen blender   # printed once; keys.json only stores its hash
+node gateway.mjs revoke blender   # revoke it
+```
+
+Once a key exists, the MCP server starts the gateway whenever it starts, and the gateway exits when the MCP server does, so you do not need a separate autostart. With no key, no port is opened; `TRIPO_GATEWAY=0` turns it off entirely. Without the MCP server, run it on its own with `npm run gateway`.
+
+If several MCP instances run at once (opencode starts one per directory, for example), only one gets the port and the rest retry every minute. When the owner exits, another instance takes over within a minute.
+
+### Pointing clients at it
+
+| Client | Setting | Tested |
+|---|---|---|
+| Python SDK 1.x (V3) | `TripoClient(api_key=..., v3_base_url="http://127.0.0.1:8787")` | text generation, rig check, FBX conversion, download |
+| Python SDK 0.4.x (V2) | `TripoClient.BASE_URL = "http://127.0.0.1:8787/v2/openapi"`, plus aiohttp (see below) | image generation, download |
+| Official Blender add-on 0.7.3 | see below | text generation, imported into the scene |
+| tripo-cli 0.8 | `TRIPO_API_BASE_URL` environment variable | not tested |
+| `@vastai/tripo-sdk` | `baseUrl` option | not tested |
+
+### Blender add-on
+
+The official add-on bundles SDK 0.4.x. When Blender's Python has no aiohttp, the SDK falls back to a minimal client that hardcodes port 443 and TLS, so whatever port you put in the URL is ignored. That means two steps:
+
+1. Install aiohttp where Blender loads user dependencies. Blender 5.2 reads `scripts\addons\modules`, not `scripts\modules`:
+   ```powershell
+   & "<Blender install>\5.2\python\bin\python.exe" -m pip install --target "$env:APPDATA\Blender Foundation\Blender\5.2\scripts\addons\modules" aiohttp
+   ```
+   Because it lives in your user folder, a Blender upgrade or Steam update will not wipe it.
+2. Change `BASE_URL` in the add-on's `tripo3d/client.py` to `http://127.0.0.1:8787/v2/openapi`, then paste the gateway key into the add-on's API Key field.
+
+If you would rather not install aiohttp, run the gateway on 443 with `--tls-cert` and `--tls-key`. That route was tested too, but it needs your own CA imported into the system's trusted roots, because Python 3.13 and later reject a single self-signed certificate. And if a tool such as Clash has taken over `127.0.0.1:443`, bind to `::1` instead and use `https://::1/v2/openapi` in the add-on.
+
+### Differences from the official API
+
+The gateway only maps what Studio can do equivalently. Everything else gets an explicit error in the official format; it never silently substitutes something similar.
+
+- **Supported tasks**: `text_to_model`, `image_to_model`, `multiview_to_model`, `texture_model`, `highpoly_to_lowpoly`, `mesh_segmentation`, `mesh_completion`, `mesh/uv`, `animate_prerigcheck`, `animate_rig`, `animate_retarget`, `convert_model`, `import_model`, `text_to_image`, `generate_image`, `image_to_multiview`, plus task query, task list, balance, usage and file upload.
+- **Model versions**: `v3.1-20260211`, `v3.0-20250812`, `v2.5-20250123` and `P2-20260801` (Studio's Smart Mesh P2). Turbo, P1, v2.0 and v1.4 have no Studio equivalent and return an error listing the available versions. As in the official V3 API, `model` is required.
+- **Narrower options**: `texture_model` takes a reference image but no text prompt; `highpoly_to_lowpoly` requires `face_limit`; rigging does not offer the `tripo` skeleton spec; retargeting takes presets only, one per task; multi-view needs all four views.
+- **Not supported**: negative prompts, `style`, refine, Gaussian splats, depth maps, USDZ, webhooks, WebSocket task watch.
+- **Projects are linear.** Studio's post-processing rewrites a project's current model, so `original_model_task_id` must be the project's latest task, and a project runs one operation at a time. The official API has no such limit.
+- **Outputs are local.** Finished files are cached in `~/.tripo/gateway/files` and served from signed local links.
+
+The gateway listens on `127.0.0.1` by default. A key can spend your subscription credits, so do not hand it out, and think about who can reach the port before exposing it to your LAN.
 
 ## Cost
 

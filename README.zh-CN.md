@@ -99,6 +99,65 @@ magpie library mcp add tripo-studio node /absolute/path/to/server.mjs agents=ope
 | `HTTPS_PROXY` | 空 | 同上，优先级低于 `TRIPO_PROXY` |
 | `TRIPO_NO_PROXY` | 空 | 设成任意值就强制直连 |
 | `TRIPO_USER_AGENT` | Chrome 156 UA | 一般不需要改 |
+| `TRIPO_GATEWAY` | 空 | 设成 `0` 就不再跟随 MCP 拉起网关 |
+| `TRIPO_GATEWAY_PORT` | `8787` | 网关端口 |
+| `TRIPO_GATEWAY_HOST` | `127.0.0.1` | 网关监听地址 |
+| `TRIPO_GATEWAY_DIR` | `~/.tripo/gateway` | key 哈希、任务记录和产物缓存 |
+| `TRIPO_GATEWAY_PUBLIC_URL` | 按地址和端口推算 | 产物下载链接的前缀，反向代理后面才需要改 |
+| `TRIPO_GATEWAY_TLS_CERT` / `TRIPO_GATEWAY_TLS_KEY` | 空 | 证书和私钥，两个都给就改跑 HTTPS |
+
+## 官方 API 兼容网关
+
+`gateway.mjs` 在本机开一个跟 Tripo 官方 API 兼容的 HTTP 服务，V3（`/v3/*`）和 V2（`/v2/openapi/*`）都支持。官方 SDK、CLI 和 Blender 插件只要把 API 地址指向网关、换上网关签发的 key，就能照原来的写法调用，扣的是 Studio 订阅积分。
+
+### 启动
+
+先签一把 key：
+
+```bash
+node gateway.mjs keygen blender   # key 只在这里显示一次，keys.json 里只存哈希
+node gateway.mjs revoke blender   # 作废
+```
+
+签过 key 之后，MCP server 每次启动都会顺带拉起网关，MCP 退出时网关跟着退出，不用另外配开机自启。没签过 key 就不开端口；设 `TRIPO_GATEWAY=0` 可以彻底关掉。不跑 MCP 时也能单独启动：`npm run gateway`。
+
+同时开着多个 MCP 实例时（例如 opencode 在不同目录各起一个），只有一个能占到端口，其余每分钟重试一次。占着端口的那个退出后，最多一分钟就会有别的实例接手。
+
+### 客户端怎么指过来
+
+| 客户端 | 设置 | 实测 |
+|---|---|---|
+| Python SDK 1.x（V3） | `TripoClient(api_key=..., v3_base_url="http://127.0.0.1:8787")` | 文字生成、绑定预检、转 FBX、下载 |
+| Python SDK 0.4.x（V2） | `TripoClient.BASE_URL = "http://127.0.0.1:8787/v2/openapi"`，还要装 aiohttp（原因见下节） | 图生模型、下载 |
+| 官方 Blender 插件 0.7.3 | 见下节 | 文字生成并导入场景 |
+| tripo-cli 0.8 | 环境变量 `TRIPO_API_BASE_URL` | 未测 |
+| `@vastai/tripo-sdk` | `baseUrl` 选项 | 未测 |
+
+### Blender 插件
+
+官方插件内置的是 SDK 0.4.x。它在 Blender 自带的 Python 里找不到 aiohttp 时，会换用一个简易客户端，而这个客户端把 443 端口和 TLS 写死了，网址里写什么端口都没用。所以要做两件事：
+
+1. 把 aiohttp 装进 Blender 加载用户依赖的目录。Blender 5.2 读的是 `scripts\addons\modules`，不是 `scripts\modules`：
+   ```powershell
+   & "<Blender 安装目录>\5.2\python\bin\python.exe" -m pip install --target "$env:APPDATA\Blender Foundation\Blender\5.2\scripts\addons\modules" aiohttp
+   ```
+   装在用户目录里，升级 Blender 或 Steam 更新都不会把它冲掉。
+2. 把插件 `tripo3d/client.py` 里的 `BASE_URL` 改成 `http://127.0.0.1:8787/v2/openapi`，再把网关 key 填进插件的 API Key 栏。
+
+不想装 aiohttp 的话，也可以让网关带上 `--tls-cert` 和 `--tls-key` 跑在 443 上。这条路实测可用，但要自建一个 CA 并导入系统的受信任根证书：Python 3.13 以上会拒绝只有一级的自签证书。如果本机有 Clash 一类工具接管了 `127.0.0.1:443`，还得改绑 `::1`，插件地址也要写成 `https://::1/v2/openapi`。
+
+### 和官方 API 的差别
+
+网关只做能等价映射的功能。其余请求一律按官方格式返回明确的错误，不会悄悄换成近似的做法。
+
+- **支持的任务**：`text_to_model`、`image_to_model`、`multiview_to_model`、`texture_model`、`highpoly_to_lowpoly`、`mesh_segmentation`、`mesh_completion`、`mesh/uv`、`animate_prerigcheck`、`animate_rig`、`animate_retarget`、`convert_model`、`import_model`、`text_to_image`、`generate_image`、`image_to_multiview`，以及任务查询、任务列表、余额、消耗记录和文件上传。
+- **模型版本**：`v3.1-20260211`、`v3.0-20250812`、`v2.5-20250123`、`P2-20260801`（对应 Studio 的智能网格 P2）。Turbo、P1、v2.0、v1.4 Studio 没有等价版本，会报错并列出可用版本。V3 的 `model` 字段和官方一样是必填。
+- **功能少一些**：`texture_model` 只接受参考图，不接受文字；`highpoly_to_lowpoly` 必须给 `face_limit`；绑定不支持 `tripo` 骨骼规范；套动作只能用预设，一个任务一个动作；多视图必须四个视角都给。
+- **不支持**：负向提示词、`style` 风格化、精修（refine）、高斯泼溅、深度图、USDZ、webhook、WebSocket 任务推送。
+- **项目是线性的**。Studio 的后处理会改写项目的当前模型，所以 `original_model_task_id` 必须是该项目最新的一个任务，同一个项目同一时间只能跑一个操作。官方 API 没有这个限制。
+- **产物在本地**。任务完成后，文件缓存在 `~/.tripo/gateway/files`，通过带签名的本地链接下载。
+
+网关默认只监听 `127.0.0.1`。拿到 key 就能花你的订阅积分，所以不要把 key 发给别人；要开到局域网，先想清楚谁能连进来。
 
 ## 花费
 
