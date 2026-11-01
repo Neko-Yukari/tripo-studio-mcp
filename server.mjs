@@ -186,7 +186,7 @@ const GENERATE_DEFAULTS = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 面数预设：直接调 face_limit 太容易抳出百兆模型，给个台阶
+// 面数预设：直接调 face_limit 太容易搞出百兆模型，给个台阶
 const FACE_PRESETS = { low: 30000, medium: 150000, high: 800000 };
 
 // 官方 API 文档里的参数名，原样透传（见 platform.tripo3d.ai/docs/generation）
@@ -216,8 +216,13 @@ function progressId(data) {
   return d.operation_id || d.operator_id || d.task_id || d.project_id || d.id || null;
 }
 
-// 后处理接口的 part_name_list 用的是项目根节点名（tripo_node_<根 operator>），重拓扑后也不变
+// 后处理接口的 part_names / part_name_list 就是当前模型里带网格的节点名：
+// 生成的模型是 tripo_node_<根 operator>，导入的模型是原文件里的物体名，拆分后是 tripo_part_N
 async function meshPartNames(projectId) {
+  try {
+    const names = await modelMeshNodeNames(projectId);
+    if (names && names.length) return names;
+  } catch { /* 落到按历史推导 */ }
   try {
     const h = await api('GET', `/project/history/${projectId}?locale=zh-CN`);
     const list = h?.data?.history || [];
@@ -233,6 +238,40 @@ async function meshPartNames(projectId) {
     if (m) return [`tripo_node_${m[1]}`];
   } catch { /* 忽略 */ }
   return null;
+}
+
+// 读项目当前模型的带网格节点名。GLB 只拉 JSON 块；FBX（重拓扑或导入的模型）整个下载后用 assimp 读场景树
+async function modelMeshNodeNames(projectId) {
+  const det = await api('GET', `/project/detail/v3/${projectId}?locale=zh-CN`);
+  const url = det?.data?.model_url;
+  if (!url) return null;
+  const head = await request('GET', url, { headers: { range: 'bytes=0-19' }, binary: true });
+  let j;
+  if (head.buf.readUInt32LE(0) === 0x46546c67) {
+    const len = head.buf.readUInt32LE(12);
+    const r = await request('GET', url, { headers: { range: `bytes=20-${19 + len}` }, binary: true });
+    j = JSON.parse(r.buf.subarray(0, len).toString('utf8'));
+  } else if (head.buf.subarray(0, 11).toString('latin1') === 'Kaydara FBX') {
+    const r = await request('GET', url, { binary: true });
+    const files = await convertModel(r.buf, 'gltf2', 'scene', 'fbx');
+    const g = files.find((f) => f.name.endsWith('.gltf'));
+    if (!g) return null;
+    j = JSON.parse(g.data.toString('utf8'));
+  } else {
+    return null;
+  }
+  return [...new Set((j.nodes || []).filter((n) => n.mesh !== undefined && n.name).map((n) => n.name))];
+}
+
+async function waitImageAsset(assetId, deadline) {
+  if (!assetId) throw new Error('生图任务没拿到 asset_id');
+  while (Date.now() < deadline) {
+    await sleep(4000);
+    const a = (await api('POST', '/image/get_image_asset', { asset_id: assetId })).data || {};
+    if (a.status === 'success') return a;
+    if (['failed', 'banned', 'cancelled'].includes(a.status)) throw new Error(`生图 ${assetId} ${a.status}`);
+  }
+  throw new Error(`生图 ${assetId} 超时，可稍后在 Studio 图片面板查看`);
 }
 
 async function waitTask(id, timeoutMs) {  const t0 = Date.now();
@@ -258,26 +297,46 @@ async function waitTask(id, timeoutMs) {  const t0 = Date.now();
   return { ...last, timedOut: true, id };
 }
 
-async function downloadModel(projectId, outPath, format = 'glb', animated = false) {
+async function downloadModel(projectId, outPath, format = 'glb', animated = false, opts = {}) {
   const det = await api('GET', `/project/detail/v3/${projectId}?locale=zh-CN`);
-  let url = det?.data?.model_url;
-  if (animated) {
-    // 动画不在主模型上，而在 operator.retarget[] 的 model_url 里
-    const list = det?.data?.operator?.retarget || [];
-    const latest = list.filter((x) => x.status === 'success' && x.model_url)[0];
-    if (latest) url = latest.model_url;
-  }
+  const url = det?.data?.model_url;
   if (!url) throw new Error('项目里没有 model_url');
   const r = await request('GET', url, { binary: true });
   if (r.status !== 200) throw new Error('下载失败 HTTP ' + r.status);
-  const dest = path.resolve(outPath);
+  if (animated) {
+    // 动画不在主模型上，而在 operator.retarget[]（新的在前）；那个 GLB 只有骨骼和动画轨道
+    const list = (det?.data?.operator?.retarget || []).filter((x) => x.status === 'success' && x.model_url);
+    if (!list.length) throw new Error('项目还没有套过动画，先用 tripo_animate');
+    const picks = opts.animation_name
+      ? list.filter((x) => String(x.name).toLowerCase() === opts.animation_name.toLowerCase())
+      : opts.all_animations ? list : [list[0]];
+    if (!picks.length) throw new Error(`没有名为 ${opts.animation_name} 的动画，可选：${list.map((x) => x.name).join(' / ')}`);
+    const anims = [];
+    for (const p of picks) {
+      const a = await request('GET', p.model_url, { binary: true });
+      if (a.status !== 200) throw new Error('下载动画失败 HTTP ' + a.status);
+      anims.push({ name: p.name, buf: a.buf });
+    }
+    let dest = path.resolve(outPath);
+    if (path.extname(dest).toLowerCase() !== '.glb') dest = dest.replace(/\.[^.\\/]*$/, '') + '.glb';
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const out = opts.animation_only ? anims[0].buf : mergeAnimationsIntoGlb(r.buf, anims);
+    fs.writeFileSync(dest, out);
+    return { path: dest, bytes: out.length, format: 'glb', animations: anims.map((a) => a.name), with_mesh: !opts.animation_only };
+  }
+  let dest = path.resolve(outPath);
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  if (format === 'glb') {
+  // 四边面重拓扑之后，项目当前模型是 FBX 而不是 GLB，按文件头判断
+  const src = r.buf.subarray(0, 4).toString('latin1') === 'glTF' ? 'glb'
+    : r.buf.subarray(0, 11).toString('latin1') === 'Kaydara FBX' ? 'fbx' : 'glb';
+  if (format === src || (format === 'glb' && src === 'fbx')) {
+    // 源文件就是目标格式；或源是 FBX 却要 GLB——直接给 FBX，避免二次转换丢四边面
+    if (path.extname(dest).toLowerCase() !== `.${src}`) dest = dest.replace(/\.[^.\\/]*$/, '') + `.${src}`;
     fs.writeFileSync(dest, r.buf);
-    return { path: dest, bytes: r.buf.length, format: 'glb' };
+    return { path: dest, bytes: r.buf.length, format: src, ...(src !== format ? { note: '该项目当前模型是四边面 FBX，已按原格式保存' } : {}) };
   }
   const base = path.basename(dest, path.extname(dest));
-  const files = await convertModel(r.buf, format, base);
+  const files = await convertModel(r.buf, format, base, src);
   if (files.length === 1 && !files[0].archive) {
     const single = path.join(path.dirname(dest), `${base}.${format}`);
     fs.writeFileSync(single, files[0].data);
@@ -298,8 +357,8 @@ async function downloadModel(projectId, outPath, format = 'glb', animated = fals
 
 let assimpModule = null;
 
-async function convertModel(glbBuf, format, name) {
-  if (!['fbx', 'obj', 'stl'].includes(format)) throw new Error(`不支持的格式：${format}`);
+async function convertModel(glbBuf, format, name, srcExt = 'glb') {
+  if (!['fbx', 'obj', 'stl', 'gltf2', '3mf'].includes(format)) throw new Error(`不支持的格式：${format}`);
   if (!assimpModule) {
     const js = path.join(ASSIMP_DIR, 'assimpjs.cjs');
     const wasm = path.join(ASSIMP_DIR, 'assimpjs.wasm');
@@ -310,7 +369,7 @@ async function convertModel(glbBuf, format, name) {
     assimpModule = await (typeof factory === 'function' ? factory : factory.default || factory.assimpjs)({ locateFile: () => wasm });
   }
   const list = new assimpModule.FileList();
-  list.AddFile('model.glb', new Uint8Array(glbBuf));
+  list.AddFile(`model.${srcExt}`, new Uint8Array(glbBuf));
   const result = assimpModule.ConvertFileList(list, format, {}, name);
   if (!result.IsSuccess() || result.FileCount() === 0) {
     throw new Error(`转换 ${format} 失败：${result.GetErrorCode()}`);
@@ -320,7 +379,8 @@ async function convertModel(glbBuf, format, name) {
     const f = result.GetFile(i);
     const data = Buffer.from(f.GetContent());
     const entry = f.GetPath?.() || f.GetName?.() || `result.${format}`;
-    if (data[0] === 0x50 && data[1] === 0x4b && data[2] === 0x03 && data[3] === 0x04) {
+    // fbx/obj 带贴图时转换器会打成 zip；3mf 本身就是 zip 容器，不能解开
+    if (format !== '3mf' && data[0] === 0x50 && data[1] === 0x4b && data[2] === 0x03 && data[3] === 0x04) {
       for (const z of readZip(data)) out.push({ name: z.name, data: z.data, archive: true });
     } else {
       out.push({ name: path.basename(entry), data, archive: false });
@@ -329,6 +389,73 @@ async function convertModel(glbBuf, format, name) {
   result.delete?.();
   list.delete?.();
   return out;
+}
+
+/* ---------- 动画合并：把 retarget 产出的动画轨道并进绑定后的网格 GLB ---------- */
+
+function parseGlb(buf) {
+  if (buf.readUInt32LE(0) !== 0x46546c67) throw new Error('不是 GLB');
+  let off = 12, json = null, bin = Buffer.alloc(0);
+  while (off < buf.length) {
+    const len = buf.readUInt32LE(off), type = buf.readUInt32LE(off + 4);
+    const chunk = buf.subarray(off + 8, off + 8 + len);
+    if (type === 0x4e4f534a) json = JSON.parse(chunk.toString('utf8'));
+    else if (type === 0x004e4942) bin = chunk;
+    off += 8 + len;
+  }
+  return { json, bin };
+}
+
+function writeGlb(json, bin) {
+  const pad = (b, c) => (b.length % 4 ? Buffer.concat([b, Buffer.alloc(4 - (b.length % 4), c)]) : b);
+  const j = pad(Buffer.from(JSON.stringify(json), 'utf8'), 0x20);
+  const b = pad(bin, 0);
+  const header = Buffer.alloc(12);
+  header.writeUInt32LE(0x46546c67, 0); header.writeUInt32LE(2, 4);
+  header.writeUInt32LE(12 + 8 + j.length + 8 + b.length, 8);
+  const jh = Buffer.alloc(8); jh.writeUInt32LE(j.length, 0); jh.writeUInt32LE(0x4e4f534a, 4);
+  const bh = Buffer.alloc(8); bh.writeUInt32LE(b.length, 0); bh.writeUInt32LE(0x004e4942, 4);
+  return Buffer.concat([header, jh, j, bh, b]);
+}
+
+// 动画 GLB 与绑定 GLB 的骨骼同名，按名字把通道重新指到网格文件的节点上
+function mergeAnimationsIntoGlb(meshBuf, anims) {
+  const base = parseGlb(meshBuf);
+  const g = base.json;
+  const nodeIndex = new Map((g.nodes || []).map((n, i) => [n.name, i]));
+  const parts = [base.bin];
+  let binLen = base.bin.length;
+  g.bufferViews = g.bufferViews || [];
+  g.accessors = g.accessors || [];
+  g.animations = g.animations || [];
+  for (const anim of anims) {
+    const a = parseGlb(anim.buf);
+    if ((a.json.buffers || []).length > 1) throw new Error('动画 GLB 结构不支持（多个 buffer）');
+    const align = (4 - (binLen % 4)) % 4;
+    if (align) { parts.push(Buffer.alloc(align)); binLen += align; }
+    const shift = binLen;
+    parts.push(a.bin); binLen += a.bin.length;
+    const bvBase = g.bufferViews.length, accBase = g.accessors.length;
+    for (const bv of a.json.bufferViews || []) g.bufferViews.push({ ...bv, buffer: 0, byteOffset: (bv.byteOffset || 0) + shift });
+    for (const acc of a.json.accessors || []) g.accessors.push({ ...acc, ...(acc.bufferView !== undefined ? { bufferView: acc.bufferView + bvBase } : {}) });
+    for (const an of a.json.animations || []) {
+      const channels = [];
+      for (const ch of an.channels) {
+        const idx = nodeIndex.get(a.json.nodes[ch.target.node]?.name);
+        if (idx !== undefined) channels.push({ ...ch, target: { ...ch.target, node: idx } });
+      }
+      if (!channels.length) throw new Error('动画骨骼与模型对不上，可能项目重新绑定过');
+      g.animations.push({
+        ...an,
+        name: anim.name || an.name,
+        channels,
+        samplers: an.samplers.map((s) => ({ ...s, input: s.input + accBase, output: s.output + accBase })),
+      });
+    }
+  }
+  const bin = Buffer.concat(parts);
+  g.buffers[0].byteLength = bin.length;
+  return writeGlb(g, bin);
 }
 
 function readZip(buf) {
@@ -363,7 +490,15 @@ function slug(s) {
 }
 
 async function uploadImage(filePath) {
-  const ext = (path.extname(filePath).slice(1) || 'png').toLowerCase();
+  const { bucket, key } = await uploadFile(filePath, 'png');
+  const audit = await api('POST', '/audit/image', { image: { bucket, key } });
+  const auditResult = audit?.data?.result;
+  if (auditResult !== undefined && auditResult !== 'pass') throw new Error('图片审核未通过: ' + auditResult);
+  return { bucket, key, audit: auditResult };
+}
+
+async function uploadFile(filePath, defaultExt) {
+  const ext = (path.extname(filePath).slice(1) || defaultExt).toLowerCase();
   const payload = fs.readFileSync(filePath);
   const tk = await api('POST', '/storage/temporary_token', { client: 'aws', format: ext });
   const creds = tk.data;
@@ -373,21 +508,26 @@ async function uploadImage(filePath) {
   if (put.status !== 200 && put.status !== 204) {
     throw new Error(`S3 上传失败 HTTP ${put.status} ${String(put.text).slice(0, 300)}`);
   }
-  const audit = await api('POST', '/audit/image', { image: { bucket: creds.resource_bucket, key: creds.resource_uri } });
-  const auditResult = audit?.data?.result;
-  if (auditResult !== undefined && auditResult !== 'pass') throw new Error('图片审核未通过: ' + auditResult);
-  return { bucket: creds.resource_bucket, key: creds.resource_uri, audit: auditResult };
+  return { bucket: creds.resource_bucket, key: creds.resource_uri };
 }
 
 /* ---------- MCP 工具表 ---------- */
 
+// Studio 前端的版本枚举：H3.1 / H3.0 / H2.5，以及“智能网格”P1.0 / P2.0（内部叫 Nexus）
 const MODEL_VERSIONS = [
-  'v3.1-20260211', 'v3.0-20250812', 'v2.5-20250123', 'v2.0-20240919', 'P1-20260311', 'Turbo-v1.0-20250506',
+  'v3.1-20260211', 'v3.0-20250812', 'v2.5-20250123', 'Nexus-v1.0-20260214', 'Nexus-v2.0-20260801',
 ];
+
+// 动画预设（取自前端 bundle），biped 有 97 个，其余骨骼类型各 1 个
+const RIG_TYPES = ['biped', 'quadruped', 'hexapod', 'octopod', 'avian', 'serpentine', 'aquatic', 'others'];
+const PRESET_MOTIONS = {
+  biped: 'afraid agree angry_01 angry_02 angry_03 basketball_shot bow box_01 box_02 box_03 cast_a_spell cheer chop clap climb complain_01 complain_02 crossover_dribble cry dance_01 dance_02 dance_03 dance_04 dance_05 dance_06 defeat_02 defeat_03 depressed dig dive dribble fall fire flee_01 flee_02 flip fold_arms football_catch football_save football_pass freaky frightened front_kick_01 front_kick_02 frustrated_01 frustrated_02 greet_01 greet_02 greet_03 greet_04 heart_pose hit_to_body_01 hit_to_body_02 hit_to_head hit_to_side hit_to_stomach hug idle jump_down jump jump_rope_01 jump_rope_02 laugh_01 laugh_02 lift_heavy look_around make_a_call_01 make_a_call_02 pitch_baseball play_mobile_game play_video_game press-up run_upstairs run scared_01 scared_02 scratch shoot shovel sing_01 sing_02 sing_03 sing_04 sit slash sob standing_relax surf swagger swim turn volleyball wait walk warm_up wave_goodbye_01 wave_goodbye_02'.split(' '),
+  quadruped: ['walk'], hexapod: ['walk'], octopod: ['walk'], serpentine: ['march'], aquatic: ['march'],
+};
 
 // 参数名与取值对齐官方文档 platform.tripo3d.ai/docs/generation
 const GEN_PARAMS = {
-  model_version: { type: 'string', enum: MODEL_VERSIONS, description: '模型版本，默认 v3.1-20260211；P1 系列支持四边面' },
+  model_version: { type: 'string', enum: MODEL_VERSIONS, description: '模型版本，默认 v3.1-20260211（H3.1）。v3.0 = H3.0 快速，v2.5 = H2.5 经典；Nexus-v1.0 / Nexus-v2.0 = 智能网格 P1.0 / P2.0（对应官方 API 的 P1，输出干净拓扑低模）' },
   face_limit: { type: 'integer', description: '面数上限，不填自适应。v3.1/v3.0 detailed 最多 2,000,000、standard 1,500,000；v2.5 最多 500,000；quad=true 时不超过 150,000' },
   face_preset: { type: 'string', enum: ['low', 'medium', 'high'], description: '面数预设：low 3万 / medium 15万 / high 80万，优先于 face_limit；游戏资产和 3D 打印建议 low 或 medium' },
   texture: { type: 'boolean', description: '是否生成贴图，默认 true' },
@@ -411,10 +551,13 @@ const GEN_PARAMS = {
 const TOOLS = [
   {
     name: 'tripo_status',
-    description: '查看 Tripo Studio 账号状态（套餐、到期时间、自动续费），也可查某个操作的进度。',
+    description: '查看 Tripo Studio 账号状态：剩余积分、套餐、到期时间、特殊额度；可查某个操作的进度和最近的积分流水。',
     inputSchema: {
       type: 'object',
-      properties: { task_id: { type: 'string', description: 'operator_id / task_id，可选' } },
+      properties: {
+        task_id: { type: 'string', description: 'operator_id / task_id，可选' },
+        ledger: { type: 'integer', description: '同时返回最近 N 条积分流水（扣费/退款），默认 0' },
+      },
     },
   },
   {
@@ -499,11 +642,13 @@ const TOOLS = [
   },
   {
     name: 'tripo_uv',
-    description: '智能 UV 展开，对应内部接口 operation/uv_edit/generate。会覆盖项目当前模型。',
+    description: '智能 UV 展开：uv_edit/context → generate（首次，消耗 uv_edit 额度）或 retry（同一上下文内前 3 次免费）→ apply。已有候选且 next_action=apply 时直接应用，不再消耗额度。模型需 ≤8 万三角面或 ≤4 万四边面，超了先 tripo_remesh。',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
+        apply: { type: 'boolean', description: '生成后是否立刻应用到项目，默认 true' },
+        candidate_id: { type: 'string', description: '已有候选时指定要应用哪个；不填则应用最新的' },
         wait_seconds: { type: 'integer', description: '默认 480 秒' },
       },
       required: ['project_id'],
@@ -511,13 +656,16 @@ const TOOLS = [
   },
   {
     name: 'tripo_rig',
-    description: '自动骨骼绑定，对应内部接口 operation/rigging_model。适合人形模型，椅子之类会失败。',
+    description: '自动骨骼绑定：先跑 operation/pre_rig_check（免费，对应官方 animate_prerigcheck），再调 operation/rigging_model。人形可选骨骼规范（Mixamo / UE5 / Unity / ActorCore / VRM）；非人形按预检给出的 rig_type 绑。模型面数需 ≤10 万，否则先 tripo_remesh。',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
-        rig_type: { type: 'string', description: '骨骼类型，默认 biped' },
-        part_name_list: { type: 'array', items: { type: 'string' }, description: '默认按项目根节点自动填' },
+        check_only: { type: 'boolean', description: '只做预检（是否可绑、推荐 rig_type），不扣积分；默认 false' },
+        rig_type: { type: 'string', enum: RIG_TYPES, description: '骨骼类型，默认取预检结果' },
+        spec: { type: 'string', enum: ['mixamo', 'unreal', 'unity', 'actorcore', 'vrm'], description: '人形（biped）骨骼规范，默认 mixamo；unreal = UE5 Mannequin' },
+        force: { type: 'boolean', description: '预检说不可绑时仍然尝试（界面上的“仍然尝试”），默认 false' },
+        model_version: { type: 'string', description: '绑定模型版本，默认 v3.0-20260909（界面所用）' },
         wait_seconds: { type: 'integer', description: '默认 480 秒' },
       },
       required: ['project_id'],
@@ -525,13 +673,13 @@ const TOOLS = [
   },
   {
     name: 'tripo_upscale',
-    description: '纹理放大，对应内部接口 operation/texture_upscaler。',
+    description: '纹理放大到 4K / 8K，对应内部接口 operation/texture_upscaler。项目必须已有贴图。',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
-        model_version: { type: 'string', description: '放大模型版本，目前只接受 v1.0-20250506' },
-        part_name_list: { type: 'array', items: { type: 'string' }, description: '默认按项目根节点自动填' },
+        texture_quality: { type: 'string', enum: ['detailed', 'extreme'], description: 'detailed = 4K，extreme = 8K（默认；消耗 8K 试用次数或更高套餐）。目标必须高于当前贴图：H3.1 默认生成已是 4K，再要 detailed 会报 500' },
+        model_version: { type: 'string', description: '默认 v3.0-20250812（界面所用）' },
         wait_seconds: { type: 'integer', description: '默认 480 秒' },
       },
       required: ['project_id'],
@@ -544,7 +692,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         project_id: { type: 'string' },
-        granularity: { type: 'string', enum: ['coarse', 'balanced', 'fine'], description: '拆分精度，默认 balanced（对应粗瞄/标准/精细）' },
+        granularity: { type: 'string', enum: ['simple', 'balanced', 'detailed'], description: '拆分精度：simple 粗略 3–6 个部件 / balanced 标准 6–15 个（默认）/ detailed 精细 15+ 个' },
         model_version: { type: 'string', description: '默认 v2.0-20260430' },
         wait_seconds: { type: 'integer', description: '默认 480 秒' },
       },
@@ -553,27 +701,27 @@ const TOOLS = [
   },
   {
     name: 'tripo_complete',
-    description: '部件补全，对应内部接口 operation/ai_completion。用于给拆分后的残缺部件补全几何。',
+    description: '部件补全：给 tripo_segment 拆出的部件补齐被遮挡的几何。mode=ai 调 operation/ai_completion（AI 补全），mode=quick_cap 调 operation/mesh_fill（快速封口）。项目必须先拆分。',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
-        part_names: { type: 'array', items: { type: 'string' }, description: '要补全的部件节点名' },
-        model_version: { type: 'string', description: '默认 v2.0-20260430' },
+        mode: { type: 'string', enum: ['ai', 'quick_cap'], description: '默认 ai' },
+        part_names: { type: 'array', items: { type: 'string' }, description: '要处理的部件节点名；不填则取模型里全部部件' },
+        model_version: { type: 'string', description: 'ai 模式默认 v1.0-20250506，quick_cap 默认 default' },
         wait_seconds: { type: 'integer', description: '默认 480 秒' },
       },
-      required: ['project_id', 'part_names'],
+      required: ['project_id'],
     },
   },
   {
     name: 'tripo_pbr',
-    description: '生成 PBR 材质，对应内部接口 operation/pbr_generate。',
+    description: '给已有贴图的项目生成 PBR 材质（金属度/粗糙度/法线），对应内部接口 operation/pbr_generate。',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
-        model_version: { type: 'string', description: '默认 v1.0-20250506' },
-        part_name_list: { type: 'array', items: { type: 'string' }, description: '默认不限定部件' },
+        model_version: { type: 'string', description: '默认 v3.0-20250812（界面所用）' },
         wait_seconds: { type: 'integer', description: '默认 480 秒' },
       },
       required: ['project_id'],
@@ -581,17 +729,78 @@ const TOOLS = [
   },
   {
     name: 'tripo_animate',
-    description: '文字生成动画并套到已绑定的模型上。内部先用 motion/generate 生成动作资产，再调 operation/retarget_model 重定向；模型必须先 tripo_rig。',
+    description: '给已绑定的模型套动画（operation/retarget_model）。三选一：preset 用内置动作（不生成新动作）；motion_asset_id 复用已生成的动作；prompt 先用 motion/generate 文字生成动作（仅人形）。可选值用 tripo_list_motions 查。模型必须先 tripo_rig；取结果用 tripo_download 加 animated:true。',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string' },
-        prompt: { type: 'string', description: '动作描述，例如 walk forward slowly' },
-        duration_seconds: { type: 'integer', description: '时长（秒），默认 5' },
-        rig_type: { type: 'string', description: '骨骼类型，默认 biped' },
+        preset: { type: 'string', description: '内置动作名，如 walk / run / idle / dance_01；也可写全名 preset:biped:walk' },
+        motion_asset_id: { type: 'string', description: '复用已生成的动作资产' },
+        prompt: { type: 'string', description: '文字生成动作，例如 walk forward slowly' },
+        duration_seconds: { type: 'integer', description: '文字生成时的时长（秒），默认 5' },
+        rig_type: { type: 'string', enum: RIG_TYPES, description: '骨骼类型，默认取项目绑定时的类型' },
         wait_seconds: { type: 'integer', description: '默认 480 秒' },
       },
-      required: ['project_id', 'prompt'],
+      required: ['project_id'],
+    },
+  },
+  {
+    name: 'tripo_image',
+    description: '生成 2D 图片（对应官方 text_to_image / generate_image / image_to_multiview）：文字生图、带参考图改图、套模板，或把一张图扩成前/左/后/右四视图。内部接口 image/gen_image_v2 + image/gen_multiview，结果下载为 PNG，可直接给 tripo_generate_image / tripo_generate_multiview 用。套餐内每月有免费生图次数。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: '描述；只做四视图且给了 image_paths 时可不填' },
+        image_paths: { type: 'array', items: { type: 'string' }, description: '参考图（可选，可多张），用于改图/风格参考' },
+        multiview: { type: 'boolean', description: '输出四视图。有 prompt 时先生成一张再扩四视图；只有一张 image_paths 时直接拿它扩' },
+        model: {
+          type: 'string',
+          enum: ['gemini_3.1_flash_image_preview', 'gemini_3_pro_image_preview', 'gemini_2.5_flash_image_preview', 'gpt_image_2.5_sunburst', 'gpt_image_2', 'gpt_image_1.5', 'gpt_4o', 'flux.1_kontext_pro', 'flux.1_dev', 'midjourney'],
+          description: '默认 gemini_3.1_flash_image_preview（Nano Banana 2）；gemini_3_pro = Nano Banana Pro，gpt_image_2.5_sunburst = GPT Image 2.5',
+        },
+        aspect_ratio: { type: 'string', enum: ['1:1', '16:9', '9:16', '4:3', '3:4'], description: '默认 1:1' },
+        resolution: { type: 'string', enum: ['1K', '2K', '4K'], description: '默认 1K' },
+        amount: { type: 'integer', description: '生成张数 1–4，默认 1（multiview 时固定 1）' },
+        template_id: { type: 'string', description: '模板 id（如角色拆分、T 姿势），用 list_templates:true 查' },
+        list_templates: { type: 'boolean', description: '只列出可用模板，不生成' },
+        t_pose: { type: 'boolean', description: '要求角色摆 T 姿势（便于后续绑定），默认 false' },
+        out_dir: { type: 'string', description: '默认 tripo-out/images/<asset_id>' },
+        wait_seconds: { type: 'integer', description: '默认 300 秒' },
+      },
+    },
+  },
+  {
+    name: 'tripo_import',
+    description: '把本地模型（GLB / FBX / OBJ / STL，≤150MB）导入 Studio 变成一个项目（对应官方 import_model），之后可以对它用 tripo_texture / tripo_remesh / tripo_rig / tripo_animate 等。内部接口 operation/import_user_model。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        model_path: { type: 'string', description: '本地模型文件' },
+        name: { type: 'string', description: '项目名，默认文件名' },
+        use_original_uv: { type: 'boolean', description: '保留原有 UV，默认 true' },
+        transform_matrix: { type: 'array', items: { type: 'number' }, description: '4×4 变换矩阵（16 个数，列主序），默认单位矩阵；用来把模型转到正面朝前' },
+        wait_seconds: { type: 'integer', description: '默认 480 秒' },
+      },
+      required: ['model_path'],
+    },
+  },
+  {
+    name: 'tripo_list_projects',
+    description: '列出账号里的模型项目（按时间倒序），拿 project_id 给其他工具用。对应内部接口 assets/v2。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        offset: { type: 'integer', description: '默认 0' },
+        size: { type: 'integer', description: '每页条数，默认 20，最多 50' },
+      },
+    },
+  },
+  {
+    name: 'tripo_list_motions',
+    description: '列出可用的动作：自己文字生成过的动作资产（可用 motion_asset_id 复用），以及按骨骼类型分组的内置预设动作名。',
+    inputSchema: {
+      type: 'object',
+      properties: { rig_type: { type: 'string', enum: RIG_TYPES, description: '只看某种骨骼的预设，默认全部' } },
     },
   },
   {
@@ -601,9 +810,12 @@ const TOOLS = [
       type: 'object',
       properties: {
         project_id: { type: 'string' },
-        format: { type: 'string', enum: ['glb', 'fbx', 'obj', 'stl'], description: '默认 glb' },
+        format: { type: 'string', enum: ['glb', 'fbx', 'obj', 'stl', '3mf'], description: '默认 glb；3mf 只含几何，用于 3D 打印' },
         out_path: { type: 'string', description: '默认 tripo-out/<project_id>.glb；转换格式的扩展名会自动替换' },
-        animated: { type: 'boolean', description: '下载已套用的动画 GLB：只含骨骼和动画轨道、没有网格，在 Blender 里叠加到绑定后的静态模型上使用；默认 false' },
+        animated: { type: 'boolean', description: '下载带动画的 GLB：绑定后的网格 + 骨骼 + 动画在同一个文件（本地合并），默认取最近一次套的动画；默认 false' },
+        animation_name: { type: 'string', description: '指定动画名（如 preset:biped:run、Wave Right Hand）' },
+        all_animations: { type: 'boolean', description: '把项目套过的所有动画都并进一个 GLB（多个 Action）' },
+        animation_only: { type: 'boolean', description: '只要 Studio 原始动画 GLB（无网格）' },
       },
       required: ['project_id'],
     },
@@ -620,6 +832,7 @@ async function callTool(name, args) {
     try {
       const p = await api('GET', '/user/profile/payment');
       out.member = p.data?.member;
+      out.credits = p.data?.wallet;
       out.subscription = {
         type: p.data?.subscription?.type, period: p.data?.subscription?.period,
         valid_until: p.data?.subscription?.valid_until, auto_renew: p.data?.subscription?.auto_renew,
@@ -632,6 +845,13 @@ async function callTool(name, args) {
     if (args.task_id) {
       const j = await api('POST', '/progress', { ids: [args.task_id] });
       out.task = (j.data || [])[0];
+    }
+    if (args.ledger) {
+      const l = await api('GET', `/txn/records?page_num=1&page_size=${Math.min(args.ledger, 50)}`);
+      out.ledger = (l.data?.records || []).map((r) => ({
+        time: r.create_time, type: r.sub_type, txn: r.txn_type, amount: r.direction === 'sub' ? -r.amount : r.amount,
+        status: r.status, operator_id: r.operator_id,
+      }));
     }
     return out;
   }
@@ -745,21 +965,44 @@ async function callTool(name, args) {
     const det = await api('GET', `/project/detail/v3/${args.project_id}?locale=zh-CN`);
     const cur = det?.data?.operator?.operator_id;
     if (!cur) throw new Error('取不到项目当前 operator');
-    // 必须先取一次 context，action 要用上下文给出的 next_action（generate / retry）
+    // 上下文返回 next_action：generate（首次）/ retry（重试，前 3 次免费）/ apply（已有候选）
     const ctxRes = await api('POST', '/operation/uv_edit/context', { current_operator_id: cur, project_id: args.project_id });
-    const action = ctxRes?.data?.next_action || 'generate';
-    const target = ctxRes?.data?.current_operator_id || cur;
+    const ctx = ctxRes?.data || {};
+    const action = ctx.next_action || 'generate';
+    const target = ctx.current_operator_id || cur;
+    const free = ctx.candidates?.length ? Math.max(4 - ctx.candidates.length, 0) : 4;
+
+    if (action === 'apply') {
+      const cands = (ctx.candidates || []).slice().sort((a, b) => b.created_at - a.created_at);
+      const pick = args.candidate_id ? cands.find((c) => c.operator_id === args.candidate_id) : cands[0];
+      if (!pick) throw new Error(`指定的候选 ${args.candidate_id} 不存在`);
+      await api('POST', '/operation/uv_edit/apply', { project_id: args.project_id, current_operator_id: target, candidate_operator_id: pick.operator_id });
+      return { operator_id: pick.operator_id, project_id: args.project_id, status: 'success', note: '已应用已有候选，用 tripo_download 取结果' };
+    }
+
     const j = await api('POST', '/operation/uv_edit/generate', { action, current_operator_id: target, project_id: args.project_id });
-    const id = progressId(j.data) || target;
+    const id = j.data?.operator_id || progressId(j.data);
     const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
-    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: 'UV 仍在展开，稍后用 tripo_download' };
-    return { operator_id: id, project_id: args.project_id, status: st.status, note: '项目模型已更新，用 tripo_download 取结果' };
+    // retry 前 3 次免费，之后才扣积分；generate 首次消耗 uv_edit 额度
+    const charged = action === 'generate' || free === 0;
+    if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, action, charged, note: 'UV 仍在展开；完成后只是候选，稍后重调 tripo_uv 会直接应用最新候选' };
+    if (args.apply === false) return { operator_id: id, project_id: args.project_id, status: st.status, action, charged, note: '候选已生成但未应用；之后调 tripo_uv 会应用最新候选' };
+    // generate/retry 只产出候选，必须 apply 才会替换项目当前模型
+    await api('POST', '/operation/uv_edit/apply', { project_id: args.project_id, current_operator_id: target, candidate_operator_id: id });
+    return { operator_id: id, project_id: args.project_id, status: st.status, action, charged, note: 'UV 已应用到项目，用 tripo_download 取结果' };
   }
 
   if (name === 'tripo_rig') {
-    const parts = args.part_name_list || await meshPartNames(args.project_id);
-    const body = { project_id: args.project_id, rig_type: args.rig_type || 'biped' };
-    if (parts && parts.length) body.part_name_list = parts;
+    const modelVersion = args.model_version || 'v3.0-20260909';
+    const chk = (await api('POST', '/operation/pre_rig_check', { project_id: args.project_id, model_version: modelVersion })).data || {};
+    const check = { riggable: chk.riggable, rig_type: chk.rig_type, check_success: chk.check_success };
+    if (args.check_only) return check;
+    if (chk.riggable === false && !args.force && (args.rig_type || 'biped') === 'biped') {
+      return { ...check, status: 'not_rigged', note: '预检认为不适合人形绑定；可按 rig_type 换类型，或加 force:true 仍然尝试（会扣积分）' };
+    }
+    const rigType = args.rig_type || chk.rig_type || 'biped';
+    const body = { project_id: args.project_id, model_version: modelVersion, rig_type: rigType };
+    if (rigType === 'biped') body.spec = args.spec || 'mixamo';
     const j = await api('POST', '/operation/rigging_model', body);
     const id = progressId(j.data);
     const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
@@ -768,9 +1011,11 @@ async function callTool(name, args) {
   }
 
   if (name === 'tripo_upscale') {
-    const parts = args.part_name_list || await meshPartNames(args.project_id);
-    const body = { project_id: args.project_id, model_version: args.model_version || 'v1.0-20250506' };
-    if (parts && parts.length) body.part_name_list = parts;
+    const body = {
+      project_id: args.project_id,
+      model_version: args.model_version || 'v3.0-20250812',
+      texture_quality: args.texture_quality || 'extreme',
+    };
     const j = await api('POST', '/operation/texture_upscaler', body);
     const id = progressId(j.data);
     const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
@@ -792,12 +1037,15 @@ async function callTool(name, args) {
   }
 
   if (name === 'tripo_complete') {
+    const quick = args.mode === 'quick_cap';
+    const parts = args.part_names || await modelMeshNodeNames(args.project_id);
+    if (!parts || parts.length < 2) throw new Error('项目还没拆分（模型里不到 2 个部件），先调 tripo_segment');
     const body = {
       project_id: args.project_id,
-      part_names: args.part_names,
-      model_version: args.model_version || 'v2.0-20260430',
+      part_names: parts,
+      model_version: args.model_version || (quick ? 'default' : 'v1.0-20250506'),
     };
-    const j = await api('POST', '/operation/ai_completion', body);
+    const j = await api('POST', quick ? '/operation/mesh_fill' : '/operation/ai_completion', body);
     const id = progressId(j.data);
     const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
     if (st.timedOut) return { operator_id: id, project_id: args.project_id, status: st.status, note: '补全仍在进行，稍后用 tripo_download' };
@@ -805,8 +1053,7 @@ async function callTool(name, args) {
   }
 
   if (name === 'tripo_pbr') {
-    const body = { project_id: args.project_id, model_version: args.model_version || 'v1.0-20250506' };
-    if (args.part_name_list && args.part_name_list.length) body.part_name_list = args.part_name_list;
+    const body = { project_id: args.project_id, model_version: args.model_version || 'v3.0-20250812' };
     const j = await api('POST', '/operation/pbr_generate', body);
     const id = progressId(j.data);
     const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
@@ -815,42 +1062,157 @@ async function callTool(name, args) {
   }
 
   if (name === 'tripo_animate') {
-    const gen = await api('POST', '/motion/generate', {
-      segments: [{ duration_seconds: args.duration_seconds || 5, prompt: args.prompt }],
-    });
-    const taskId = gen?.data?.task_id;
-    if (!taskId) throw new Error('动作任务没拿到 task_id');
-
-    // 轮询动作资产生成
+    const sources = ['preset', 'motion_asset_id', 'prompt'].filter((k) => args[k]);
+    if (sources.length !== 1) throw new Error('preset / motion_asset_id / prompt 三选一');
     const deadline = Date.now() + (args.wait_seconds || 480) * 1000;
-    let assetId = gen?.data?.asset_id || null;
-    while (!assetId) {
-      if (Date.now() > deadline) return { task_id: taskId, status: 'timeout', note: '动作仍在生成，稍后重试' };
-      await new Promise((r) => setTimeout(r, 5000));
-      const t = await api('POST', '/motion/get_task', { task_id: taskId });
-      const st = t?.data?.status;
-      if (st === 'failed') throw new Error('动作生成失败: ' + (t?.data?.error || ''));
-      assetId = t?.data?.asset_id || null;
+    let rigType = args.rig_type;
+    if (!rigType) {
+      const det = await api('GET', `/project/detail/v3/${args.project_id}?locale=zh-CN`);
+      rigType = det?.data?.operator?.rigging?.type || 'biped';
     }
 
-    const rt = await api('POST', '/operation/retarget_model', {
-      project_id: args.project_id,
-      motion_asset_id: assetId,
-      model_version: 'default',
-      rig_type: args.rig_type || 'biped',
-    });
+    let taskId = null;
+    let assetId = args.motion_asset_id || null;
+    if (args.prompt) {
+      const gen = await api('POST', '/motion/generate', {
+        segments: [{ duration_seconds: args.duration_seconds || 5, prompt: args.prompt }],
+      });
+      taskId = gen?.data?.task_id;
+      if (!taskId) throw new Error('动作任务没拿到 task_id');
+      assetId = gen?.data?.asset_id || null;
+      while (!assetId) {
+        if (Date.now() > deadline) return { task_id: taskId, status: 'timeout', note: '动作仍在生成，稍后用 tripo_list_motions 找到 asset_id 再套' };
+        await sleep(5000);
+        const t = await api('POST', '/motion/get_task', { task_id: taskId });
+        if (t?.data?.status === 'failed') throw new Error('动作生成失败: ' + (t?.data?.error || ''));
+        assetId = t?.data?.asset_id || null;
+      }
+    }
+
+    const body = { project_id: args.project_id, model_version: 'default', rig_type: rigType };
+    if (args.preset) {
+      const full = args.preset.startsWith('preset:') ? args.preset : `preset:${rigType}:${args.preset}`;
+      const name = full.split(':').pop();
+      if (!(PRESET_MOTIONS[rigType] || []).includes(name)) throw new Error(`${rigType} 没有预设动作 ${name}，用 tripo_list_motions 查`);
+      body.animations = [full];
+    } else {
+      body.motion_asset_id = assetId;
+    }
+    const rt = await api('POST', '/operation/retarget_model', body);
     const id = progressId(rt.data);
     const st = await waitTask(id, Math.max(10000, deadline - Date.now()));
     if (st.timedOut) return { task_id: taskId, asset_id: assetId, operator_id: id, status: st.status, note: '动作已生成，重定向仍在进行' };
     return { task_id: taskId, asset_id: assetId, operator_id: id, status: st.status, note: '动画已套到项目模型，用 tripo_download 取结果' };
   }
 
+  if (name === 'tripo_image') {
+    if (args.list_templates) {
+      const t = await api('GET', '/image/available_templates');
+      return (t.data?.templates || []).map((x) => ({ template_id: x.template_id, title: x.title, description: x.description, category: x.category, tags: x.secondary_tag }));
+    }
+    const deadline = Date.now() + (args.wait_seconds || 300) * 1000;
+    const refs = [];
+    for (const p of args.image_paths || []) {
+      if (!fs.existsSync(p)) throw new Error('找不到图片: ' + p);
+      const img = await uploadImage(p);
+      refs.push({ bucket: img.bucket, key: img.key, image_audit_result: img.audit, image_source: 'upload' });
+    }
+    let source = null;
+    let asset = null;
+    if (args.prompt) {
+      const body = {
+        if_upload: true,
+        sketch_to_render: false,
+        t_pose: !!args.t_pose,
+        amount: args.multiview ? 1 : Math.min(Math.max(args.amount || 1, 1), 4),
+        model_version: args.model || 'gemini_3.1_flash_image_preview',
+        prompt: args.prompt,
+        resolution: args.multiview ? undefined : (args.resolution || '1K'),
+        scale: args.multiview ? undefined : (args.aspect_ratio || (refs.length ? undefined : '1:1')),
+        template_id: args.template_id,
+      };
+      if (refs.length === 1) body.image = refs[0];
+      else if (refs.length > 1) body.images = refs;
+      const g = await api('POST', '/image/gen_image_v2', body);
+      asset = await waitImageAsset(g.data?.asset_id, deadline);
+      if (args.multiview) source = { ...asset.output.data[0], image_source: 'generate' };
+    } else if (args.multiview && refs.length === 1) {
+      source = refs[0];
+    } else {
+      throw new Error('需要 prompt；或者 multiview:true 加一张 image_paths');
+    }
+    if (source) {
+      const mv = await api('POST', '/image/gen_multiview', {
+        if_upload: true,
+        image: { bucket: source.bucket, image_audit_result: source.image_audit_result, image_source: source.image_source, key: source.key },
+      });
+      asset = await waitImageAsset(mv.data?.asset_id, deadline);
+    }
+    const dir = path.resolve(args.out_dir || `tripo-out/images/${asset.asset_id}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const files = [];
+    for (const [i, d] of (asset.output.data || []).entries()) {
+      if (!d.url) continue;
+      const name = path.basename(new URL(d.url).pathname) || `image_${i}.png`;
+      const r = await request('GET', d.url, { binary: true });
+      const p = path.join(dir, name);
+      fs.writeFileSync(p, r.buf);
+      files.push({ file: p, bytes: r.buf.length, audit: d.image_audit_result });
+    }
+    if (asset.type === 'multiview_images' && files.length === 4) {
+      // 四视图输出顺序是 front, left, back, right（与官方一致）；tripo_generate_multiview 要的是 front, left, right, back
+      const [front, left, back, right] = files.map((f) => f.file);
+      return { asset_id: asset.asset_id, type: asset.type, views: { front, left, back, right }, multiview_input: [front, left, right, back], files };
+    }
+    return { asset_id: asset.asset_id, type: asset.type, files };
+  }
+
+  if (name === 'tripo_import') {
+    if (!fs.existsSync(args.model_path)) throw new Error('找不到模型: ' + args.model_path);
+    const format = path.extname(args.model_path).slice(1).toLowerCase();
+    if (!['glb', 'fbx', 'obj', 'stl'].includes(format)) throw new Error('只支持 glb / fbx / obj / stl');
+    const { bucket, key } = await uploadFile(args.model_path, format);
+    const j = await api('POST', '/operation/import_user_model', {
+      format,
+      model: { bucket, key },
+      name: args.name || path.basename(args.model_path),
+      transform_matrix: args.transform_matrix || [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+      use_original_uv: args.use_original_uv ?? true,
+    });
+    const id = progressId(j.data);
+    const projectId = j.data?.project_id;
+    const st = await waitTask(id, (args.wait_seconds || 480) * 1000);
+    return { project_id: projectId, operator_id: id, status: st.status, ...(st.timedOut ? { note: '仍在处理' } : {}) };
+  }
+
+  if (name === 'tripo_list_projects') {
+    const size = Math.min(args.size || 20, 50);
+    const r = await api('GET', `/assets/v2?asset_type=mine&locale=zh-CN&offset=${args.offset || 0}&size=${size}&type=all`);
+    const d = r.data || {};
+    return {
+      total: d.total, used_assets: d.used_assets, max_assets: d.max_assets,
+      projects: (d.projects || []).map((p) => ({
+        project_id: p.id, name: p.project_name, type: p.type, created_at: p.created_at,
+        cover: String(p.cover_image || '').split('?')[0] || undefined,
+      })),
+    };
+  }
+
+  if (name === 'tripo_list_motions') {
+    const r = await api('POST', '/motion/list_assets', {});
+    const presets = args.rig_type ? { [args.rig_type]: PRESET_MOTIONS[args.rig_type] || [] } : PRESET_MOTIONS;
+    return {
+      generated: (r.data?.assets || []).map((a) => ({ motion_asset_id: a.asset_id, title: a.title, category: a.category, action_type: a.action_type })),
+      presets,
+    };
+  }
+
   if (name === 'tripo_download') {
-    const res = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`, args.format || 'glb', !!args.animated);
+    const res = await downloadModel(args.project_id, args.out_path || `tripo-out/${args.project_id}.glb`, args.format || 'glb', !!args.animated, args);
     if (res.dir) {
       return { dir: res.dir, format: res.format, files: res.files.map((f) => ({ file: f.path, bytes: f.bytes })) };
     }
-    return { file: res.path, bytes: res.bytes, format: res.format };
+    return { file: res.path, bytes: res.bytes, format: res.format, ...(res.animations ? { animations: res.animations, with_mesh: res.with_mesh } : {}), ...(res.note ? { note: res.note } : {}) };
   }
 
   throw new Error('unknown tool ' + name);

@@ -4,3 +4,4 @@ tripo-out/
 *.gltf
 .env
 .DS_Store
+runs/

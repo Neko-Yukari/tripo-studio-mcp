@@ -18,28 +18,36 @@ Studio 订阅正好相反，按月收费。Pro 大约每月 ¥140 含 3000 积�
 
 ## 工具
 
-| 工具 | 作用 |
-|---|---|
-| `tripo_status` | 查看套餐、到期时间、自动续费和特殊额度余额，也能查单个操作的进度 |
-| `tripo_generate_text` | 文字生成模型，等到生成完成后下载 GLB |
-| `tripo_generate_image` | 参考图生成模型，会先上传图片并送审，再下载 GLB |
-| `tripo_generate_multiview` | 用 2–4 张同一物体的不同视角生成（front / left / right / back） |
-| `tripo_remesh` | 重拓扑/减面到指定面数，可选四边面 |
-| `tripo_texture` | 重新生成贴图，可给参考图 |
-| `tripo_uv` | 智能 UV 展开 |
-| `tripo_rig` | 自动骨骼绑定（面向人形） |
-| `tripo_upscale` | 纹理放大 |
-| `tripo_segment` | 部件拆分（粗略/标准/精细） |
-| `tripo_complete` | 部件补全 |
-| `tripo_pbr` | 生成 PBR 材质 |
-| `tripo_animate` | 文字生成动作并重定向到已绑定模型；用 `tripo_download` 加 `animated: true` 取带动画的模型 |
-| `tripo_download` | 按 `project_id` 重新下载模型，`format` 可选 glb、fbx、obj、stl |
+下面每个工具都在真实 Studio 账号上跑过任务，不只是探了参数。第三列是官方 API 里对应的任务。
+
+| 工具 | 作用 | 官方 API |
+|---|---|---|
+| `tripo_status` | 积分余额、套餐、到期时间、特殊额度、最近的积分流水，也能查单个操作的进度 | `account/balance`、`account/usage`、`tasks/{id}` |
+| `tripo_list_projects` | 列出账号里的项目，最新的在前 | `tasks/list` |
+| `tripo_generate_text` | 文字生成模型，等完成后下载 | `text_to_model` |
+| `tripo_generate_image` | 参考图生成模型，先上传并送审 | `image_to_model` |
+| `tripo_generate_multiview` | 2–4 张视角图（front、left、right、back）生成模型 | `multiview_to_model` |
+| `tripo_image` | 2D 生图：文字生图、带参考图改图、套模板（T 姿势、角色拆分等）、一张图扩成前/左/后/右四视图 | `text_to_image`、`generate_image`、`image_to_multiview` |
+| `tripo_import` | 把自己的 GLB/FBX/OBJ/STL 导入成项目，之后可以用下面的工具处理 | `import_model` |
+| `tripo_remesh` | 重拓扑到指定面数，四边面或三角面 | `highpoly_to_lowpoly`、`convert_model` 的 `quad` |
+| `tripo_texture` | 重新生成贴图，可给参考图 | `texture_model` |
+| `tripo_pbr` | 给已有贴图的模型加 PBR 贴图 | `texture_model` 的 `pbr` |
+| `tripo_upscale` | 贴图放大到 4K 或 8K | 无（Studio 独有） |
+| `tripo_uv` | 智能 UV 展开，生成候选后自动应用 | `mesh/uv` |
+| `tripo_segment` | 部件拆分：simple / balanced / detailed | `mesh_segmentation` |
+| `tripo_complete` | 给拆分后的部件补齐被遮挡的几何：AI 补全或快速封口 | `mesh_completion` |
+| `tripo_rig` | 先做绑定预检再自动绑定；人形可选 Mixamo、UE5、Unity、ActorCore、VRM 骨骼规范 | `animate_prerigcheck`、`animate_rig` |
+| `tripo_animate` | 给已绑定的模型套动作：97 个人形预设、之前生成过的动作，或用文字新生成 | `animate_retarget` |
+| `tripo_list_motions` | 自己生成过的动作，以及每种骨骼可用的预设名 | 无 |
+| `tripo_download` | 下载为 glb、fbx、obj、stl 或 3mf；`animated: true` 把网格、骨骼和动画放进同一个 GLB | `convert_model`、`export_with_geometry` |
+
+做不到的功能（Studio 本身没有）：风格化（乐高、体素、Voronoi、Minecraft）、图生高斯泼溅、图生深度图、USDZ 导出、webhook。
 
 参数名跟[官方文档](https://platform.tripo3d.ai/docs/generation)保持一致，你在官方 API 上会的用法可以直接搬过来：
 
 `model_version`、`face_limit`、`face_preset`（low 3万 / medium 15万 / high 80万）、`texture`、`pbr`、`texture_quality`（standard/detailed/extreme）、`geometry_quality`（standard/detailed）、`texture_alignment`（original_image/geometry）、`quad`、`auto_size`、`orientation`（default/align_image）、`compress`（geometry/meshopt）、`smart_low_poly`、`generate_parts`、`export_uv`、`model_seed`、`texture_seed`、`visibility`（private/public/shareable）。
 
-有几个默认值需要知道。`model_version` 默认是 `v3.1-20260211`（H3.1 最高质量），一次约 55 积分。`quad=true` 会输出四边面模型，此时 `face_limit` 不能超过 150000。`generate_parts=true` 与 `texture`、`pbr`、`quad` 互斥，不能同时开。
+有几个默认值需要知道。`model_version` 默认是 `v3.1-20260211`（H3.1 最高质量），一次约 55 积分。Studio 的版本表与官方不同：`v3.0-20250812` 是 H3.0，`v2.5-20250123` 是 H2.5，`Nexus-v1.0-20260214` / `Nexus-v2.0-20260801` 是“智能网格”P1 / P2，输出干净的低模拓扑；P2 配 `quad=true` 时大部分是四边面，以 FBX 交付。`quad=true` 会输出四边面模型，此时 `face_limit` 不能超过 150000。`generate_parts=true` 与 `texture`、`pbr`、`quad` 互斥，不能同时开。
 
 ## 安装
 
@@ -98,11 +106,12 @@ magpie library mcp add tripo-studio node /absolute/path/to/server.mjs agents=ope
 
 ## 已知限制
 
-- **GLB 以外的格式在本地转换。** Studio 服务端只给 GLB：网页里导出 FBX/OBJ/STL 时，它也是先把同一个 GLB 下下来、再用浏览器里的 Assimp WASM 转，`operation/export-lite` 只负责记账。本服务器在你机器上做同样的转换，用的是内置的 Assimp 构建，所以 `format: "fbx" | "obj" | "stl"` 离线可用。FBX 和 OBJ 会连同贴图放进一个同名目录。
+- **格式转换在本地做。** Studio 服务端给的是 GLB（做过四边面重拓扑的项目则是 FBX）：网页导出时，它也是用浏览器里的 Assimp WASM 转这个文件，`operation/export-lite` 只负责记账。本服务器在你机器上做同样的转换，用的是内置的 Assimp 构建，所以 `format: "fbx" | "obj" | "stl" | "3mf"` 离线可用。FBX 和 OBJ 会连同贴图放进一个同名目录。项目本来就是 FBX 而你要 GLB 时，会直接给原 FBX，因为再转一次会丢掉四边面。
+- **带动画的下载在本地合并。** Studio 把每个套上的动作单独存成一个 GLB，里面只有骨骼和动画轨道。`animated: true` 时服务器按骨骼名把它并进绑定后的网格，得到的文件导进 Blender 就有网格、骨架和动作；`all_animations: true` 会把套过的所有动作各自作为一个 Action 放进去。
 - **转换需要 meshopt 解码器。** Tripo 的 GLB 是 gltfpack 压过的，带 `EXT_meshopt_compression` 和 `KHR_mesh_quantization`，官方原生 Assimp 读不了。内置的这份两者都支持，想换成自建版本看 `vendor/assimp/README.md`。
 - **多视图要 2–4 张对得上的图。** `operation/multiview_to_model` 用的还是单图那耹 `image` 数组，但每个元素都得先上传并通过图片审核，数组顺序就是视角顺序：front、left、right、back。两张也能用，四张轮廓最准。
 - **S3 上传不走代理。** 往 `tripo-data.s3.<region>.amazonaws.com` 发 `PUT` 时，经过本地代理会在 TLS 握手阶段被重置，所以这类主机直连，代理失败时也会自动回退直连。
-- **资产列表未验证。** `/v2/studio/assets/v2` 会拒绝我试过的所有 `type` 取值，资产页的数据又是服务端直出的，所以那个枚举值还不知道。生成接口会返回 `project_id`，取模型够用了。
+- **部分操作对模型有要求。** 绑定要求不超过 10 万面；UV 展开要求不超过 8 万三角面或 4 万四边面；做过四边面重拓扑的模型不能拆分；贴图放大必须高于当前分辨率，而 H3.1 默认已经是 4K，所以实际只能放到 8K（`extreme`）。模型太密时先跑 `tripo_remesh`。
 - **没有 webhook。** 服务端靠轮询 `progress` 拿状态，工具默认最多等 8 分钟。超时后你会拿到 `operator_id` 和 `project_id`，之后用 `tripo_download` 取模型。
 - **会话会过期**，一般是一个月左右。
 - **没有兼容性承诺。** 这些都是内部接口，Tripo 哪天改版就可能全部失效。

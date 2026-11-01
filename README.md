@@ -18,28 +18,36 @@ Use it if you already pay for Studio and want an agent to produce assets in bulk
 
 ## Tools
 
-| Tool | What it does |
-|---|---|
-| `tripo_status` | Shows plan, expiry and auto-renew, plus any special quota pools; can also poll one operation's progress |
-| `tripo_generate_text` | Text prompt → 3D model; waits for completion and downloads the GLB |
-| `tripo_generate_image` | Reference image → 3D model; uploads the image and passes its moderation check first |
-| `tripo_generate_multiview` | 2–4 views of one object (front, left, right, back) → 3D model |
-| `tripo_remesh` | Retopology / decimation to a target face count (quad or triangle) |
-| `tripo_texture` | Regenerates textures, optionally from a reference image |
-| `tripo_uv` | Smart UV unwrap |
-| `tripo_rig` | Automatic rigging (built for humanoid shapes) |
-| `tripo_upscale` | Texture upscaling |
-| `tripo_segment` | Splits a mesh into parts (coarse / balanced / fine) |
-| `tripo_complete` | Completes missing geometry on named parts |
-| `tripo_pbr` | Generates PBR materials |
-| `tripo_animate` | Text → motion clip, retargeted onto a rigged model; fetch it with `tripo_download` and `animated: true` |
-| `tripo_download` | Downloads a model again by `project_id`; `format` picks glb, fbx, obj or stl |
+Every tool below has been run against a real Studio account, not just probed. The third column names the matching task in the official API.
+
+| Tool | What it does | Official API |
+|---|---|---|
+| `tripo_status` | Credit balance, plan, expiry, special quota pools, recent credit ledger, progress of one operation | `account/balance`, `account/usage`, `tasks/{id}` |
+| `tripo_list_projects` | Lists the projects in your account, newest first | `tasks/list` |
+| `tripo_generate_text` | Text prompt → 3D model; waits and downloads it | `text_to_model` |
+| `tripo_generate_image` | Reference image → 3D model; uploads and audits the image first | `image_to_model` |
+| `tripo_generate_multiview` | 2–4 views (front, left, right, back) → 3D model | `multiview_to_model` |
+| `tripo_image` | 2D images: text → image, edit with reference images, templates (T-pose, character split…), one image → front/left/back/right views | `text_to_image`, `generate_image`, `image_to_multiview` |
+| `tripo_import` | Uploads your own GLB/FBX/OBJ/STL as a project so the tools below can work on it | `import_model` |
+| `tripo_remesh` | Retopology to a target face count, quad or triangle | `highpoly_to_lowpoly`, `convert_model` with `quad` |
+| `tripo_texture` | Regenerates textures, optionally from a reference image | `texture_model` |
+| `tripo_pbr` | Adds PBR maps to a textured model | `texture_model` with `pbr` |
+| `tripo_upscale` | Upscales textures to 4K or 8K | — (Studio only) |
+| `tripo_uv` | Smart UV unwrap; generates a candidate and applies it | `mesh/uv` |
+| `tripo_segment` | Splits a mesh into parts: simple / balanced / detailed | `mesh_segmentation` |
+| `tripo_complete` | Fills the hidden geometry of segmented parts: AI completion or quick cap | `mesh_completion` |
+| `tripo_rig` | Rig pre-check, then auto rigging; humanoids can use a Mixamo, UE5, Unity, ActorCore or VRM skeleton | `animate_prerigcheck`, `animate_rig` |
+| `tripo_animate` | Puts a motion on a rigged model: one of 97 biped presets, a motion you generated earlier, or a new one from text | `animate_retarget` |
+| `tripo_list_motions` | Your generated motions plus the preset names per rig type | — |
+| `tripo_download` | Downloads a project as glb, fbx, obj, stl or 3mf; `animated: true` returns mesh, skeleton and animation in one GLB | `convert_model`, `export_with_geometry` |
+
+Not available, because Studio itself has no such feature: stylization (lego / voxel / voronoi / minecraft), image → Gaussian splat, image → depth, USDZ export, and webhooks.
 
 Parameter names follow the [official docs](https://platform.tripo3d.ai/docs/generation), so anything you already know from the official API carries over:
 
 `model_version`, `face_limit`, `face_preset` (low 30k / medium 150k / high 800k), `texture`, `pbr`, `texture_quality` (standard/detailed/extreme), `geometry_quality` (standard/detailed), `texture_alignment` (original_image/geometry), `quad`, `auto_size`, `orientation` (default/align_image), `compress` (geometry/meshopt), `smart_low_poly`, `generate_parts`, `export_uv`, `model_seed`, `texture_seed`, `visibility` (private/public/shareable).
 
-A few defaults are worth knowing. `model_version` defaults to `v3.1-20260211` (H3.1 highest quality) and costs about 55 credits per run. Setting `quad=true` forces quad topology, and then `face_limit` cannot exceed 150,000. Setting `generate_parts=true` conflicts with `texture`, `pbr` and `quad`.
+A few defaults are worth knowing. `model_version` defaults to `v3.1-20260211` (H3.1 highest quality) and costs about 55 credits per run. Studio's version list differs from the official one: `v3.0-20250812` is H3.0, `v2.5-20250123` is H2.5, and `Nexus-v1.0-20260214` / `Nexus-v2.0-20260801` are the "smart mesh" P1 / P2 models that output clean low-poly topology (P2 with `quad=true` gives mostly quads, delivered as FBX). Setting `quad=true` forces quad topology, and then `face_limit` cannot exceed 150,000. Setting `generate_parts=true` conflicts with `texture`, `pbr` and `quad`.
 
 ## Install
 
@@ -98,11 +106,12 @@ Every generation spends Studio subscription credits: about 55 for a default text
 
 ## Known limits
 
-- **Formats other than GLB are converted locally.** Studio serves only GLB: when you export FBX/OBJ/STL in its web app, it downloads the same GLB and converts it in your browser with an Assimp WASM worker, and `operation/export-lite` merely records the action. This server does the same conversion on your machine with a bundled Assimp build, so `format: "fbx" | "obj" | "stl"` works offline. FBX and OBJ come out as a folder holding the model plus its textures.
+- **Formats are converted locally.** Studio serves a GLB (or an FBX once a project has been quad-remeshed): when you export in its web app, it converts that file in your browser with an Assimp WASM worker, and `operation/export-lite` merely records the action. This server does the same conversion on your machine with a bundled Assimp build, so `format: "fbx" | "obj" | "stl" | "3mf"` works offline. FBX and OBJ come out as a folder holding the model plus its textures. If the project is already FBX and you ask for GLB, you get the FBX unchanged, because a second conversion would lose the quads.
+- **Animated downloads are merged locally.** Studio stores each applied motion as a separate GLB that holds only bones and animation tracks. With `animated: true` the server merges it into the rigged mesh by bone name, so one file imports into Blender with mesh, armature and actions; `all_animations: true` puts every applied motion in as its own action.
 - **Conversion needs the meshopt decoder.** Tripo's GLB is gltfpack output using `EXT_meshopt_compression` and `KHR_mesh_quantization`; a stock Assimp cannot read it. The bundled build handles both. See `vendor/assimp/README.md` for how to swap in your own build.
 - **Multi-view wants 2 to 4 images that match.** `operation/multiview_to_model` takes the same `image` array as the single-image endpoint, but every element must have been uploaded and pass the image audit first, and the array order is the view order: front, left, right, back. Two views are enough; four give the best silhouette.
 - **S3 uploads bypass the proxy.** The `PUT` to `tripo-data.s3.<region>.amazonaws.com` gets its TLS handshake reset when routed through a local proxy, so those hosts connect directly and a failing proxy falls back to direct automatically.
-- **Asset listing is unverified.** `/v2/studio/assets/v2` rejects every `type` value tried, and the assets page renders from server-side data, so the enum is still unknown. Generation returns `project_id`, which is enough to fetch a model.
+- **Some operations have model limits.** Rigging needs at most 100k faces. UV unwrapping needs at most 80k triangles or 40k quads. Segmentation does not work on a quad-remeshed model. Upscaling must go above the current texture resolution, and H3.1 already outputs 4K, so in practice that means 8K (`extreme`). Run `tripo_remesh` first when a model is too dense.
 - **No webhooks.** The server polls `progress` instead. A tool waits up to 8 minutes by default; if it times out you get `operator_id` and `project_id`, and can fetch the model later with `tripo_download`.
 - **The cookie expires**, usually after about a month.
 - **No compatibility promise.** These are internal endpoints; a Tripo redesign can break them at any time.
